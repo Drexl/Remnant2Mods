@@ -15,6 +15,7 @@ print("[LoadoutNamer] Loaded and running.\n")
 -- menu context; the OnMouseEnter bound-event hook gives hover identity.
 
 local runtime = require("loadout_runtime").new("LoadoutNamer")
+local styles = require("loadout_style")
 local MOUSE_ENTER_FN = "/Game/UI2/UI_Widgets/UI_Game/UI_Game_Character/Widget_Loadout.Widget_Loadout_C:BndEvt__Widget_Loadout_Button_K2Node_ComponentBoundEvent_4_OnAdvButtonClickedEvent__DelegateSignature"
 
 -- Record 10 is the game's reserved last-gear-state auto-save (research doc 3.4w); it
@@ -439,50 +440,22 @@ end
 -- recreate loop that stacked duplicate prompts (2026-07-13 test).
 local promptsByExtra = {} -- [ExtraActionList full name] = { icon = ..., label = ... }
 
--- Whether this UE4SS build supports writing a mutated struct copy back onto a
--- property (font/color styling below). Older UE4SS builds don't, and the write
--- pierces pcall - not a catchable Lua error, it aborts the whole enclosing
--- function. Probed once per session, on whichever prompt is created first;
--- success is detected by reaching the line after the risky write, never by
--- pcall's return value. Deliberately probed AFTER the prompt widgets are
--- already recorded in promptsByExtra (see ensureRenamePrompt) so a failure
--- here can never cause the prompt-creation block to retry every tick again.
-local promptStyleProbed = false
-local promptStyleSupported = false
+-- Scalar writes were read back successfully on the installed stable runtime.
+-- Never assign Font/ColorAndOpacity/WidgetStyle userdata back as whole structs.
+local promptStyleLogged = false
+local function gameFont(sourceLabel)
+  local font = StaticFindObject(EDIT_FONT_PATH)
+  if font and font:IsValid() then return font end
+  return sourceLabel.Font.FontObject -- the already-loaded vanilla font
+end
 
-local function applyPromptLabelStyle(label)
-  if promptStyleProbed and not promptStyleSupported then
-    return -- known unsupported on this build; skip the pointless retry
-  end
-  local firstAttempt = not promptStyleProbed
-  promptStyleProbed = true
-
-  pcall(function()
-    local f = label.Font
-    f.Size = 10.0 -- before the font lookup, so a lookup failure can't abort the size
-    local font = StaticFindObject(EDIT_FONT_PATH)
-    if font and font:IsValid() then
-      f.FontObject = font
-    end
-    label.Font = f -- the risky write-back
-    promptStyleSupported = true
-  end)
-
-  if promptStyleSupported then
-    pcall(function()
-      local c = label.ColorAndOpacity
-      c.SpecifiedColor.R = 0.7
-      c.SpecifiedColor.G = 0.7
-      c.SpecifiedColor.B = 0.7
-      c.SpecifiedColor.A = 1.0
-      pcall(function() c.ColorUseRule = 0 end)
-      label.ColorAndOpacity = c
-    end)
-  end
-
-  if firstAttempt then
-    print(string.format("[LoadoutNamer] Rename-prompt label styling: %s.\n",
-      promptStyleSupported and "ok" or "skipped (struct write-back not supported on this UE4SS build)"))
+local function applyPromptLabelStyle(label, sourceLabel)
+  local ok, err = pcall(function() styles.prompt(label, gameFont(sourceLabel)) end)
+  if not ok then
+    runtime.log("Rename-prompt styling failed: " .. tostring(err))
+  elseif not promptStyleLogged then
+    promptStyleLogged = true
+    runtime.log("Rename-prompt scalar styling applied.")
   end
 end
 
@@ -535,15 +508,8 @@ local function ensureRenamePrompt(tooltip, recordIndex)
         return
       end
 
-      -- Style BEFORE the label enters the widget tree, same requirement as the
-      -- edit box (Slate builds its initial layout from whatever's already set;
-      -- styling after AddChild doesn't visually take). On a UE4SS build that
-      -- can't do struct write-back, this may abort this whole function the
-      -- FIRST time only - harmless: applyPromptLabelStyle records "probed"
-      -- before the risky write, so the very next ~50ms tooltip-poll tick skips
-      -- the styling attempt entirely and this function completes normally
-      -- (AddChild + entry recorded), from then on for the rest of the session.
-      applyPromptLabelStyle(label)
+      -- All styling is leaf-only and runs before Slate builds the label.
+      applyPromptLabelStyle(label, tooltip.ItemLabel)
 
       extra:AddChild(keyIcon)
       extra:AddChild(label)
@@ -723,120 +689,14 @@ end
 -- Target look, from dev-data/Widget_Loadout.json (~3565-3581): the tile label is
 -- EDIT_FONT_PATH size 12, color 0.7/0.7/0.7.
 
--- Sets R/G/B/A on an FSlateColor's SpecifiedColor, and pins ColorUseRule to
--- UseColor_Specified (0) - if the rule was set to inherit, the specified color
--- would be ignored no matter what we write into it.
-local function setSlateColor(slateColor, r, g, b, a)
-  slateColor.SpecifiedColor.R = r
-  slateColor.SpecifiedColor.G = g
-  slateColor.SpecifiedColor.B = b
-  slateColor.SpecifiedColor.A = a
-  pcall(function() slateColor.ColorUseRule = 0 end)
-end
-
--- Best-effort restyle toward the game's look. WidgetStyle struct writes are the
--- riskiest op class (research doc 3.4), so: every path is read-probed before it is
--- written (a failed read = that layout doesn't exist on this engine version = skip,
--- never guess), each group has its own pcall, and any failure just leaves that part
--- of the box at the engine default. Must run BEFORE the box enters the widget tree
--- so Slate builds with these values.
--- Whether whole-struct write-back to WidgetStyle is supported on this UE4SS
--- build (independent from applyPromptLabelStyle's flag - different struct type,
--- probed separately). Unlike the tooltip prompt, this only runs once per F2
--- press (not per tick), so a failure here can't spam the log - but there's no
--- reason to repeat a known-failing write-back on every rename either.
-local editBoxStyleProbed = false
-local editBoxStyleSupported = false
-
-local function styleEditBox(box)
-  if editBoxStyleProbed and not editBoxStyleSupported then
-    print("[LoadoutNamer] Edit box styling skipped (struct write-back not supported on this UE4SS build).\n")
-    return
-  end
-  local firstAttempt = not editBoxStyleProbed
-  editBoxStyleProbed = true
-
-  local fontApplied, fgApplied, bgApplied, writtenBack = false, false, false, false
-
-  pcall(function()
-    -- Read-modify-WRITE-BACK: reading a struct property may hand back a detached
-    -- copy (first attempt's nested writes changed nothing visually), so after
-    -- mutating we assign the whole struct back to the property below.
-    local style = box.WidgetStyle
-
-    -- Font: probed at both known layouts - TextStyle.Font (newer style structs) and
-    -- Font directly on the style (what this game's build actually exposes; the
-    -- TextStyle path read-fails here, confirmed via the styling log 2026-07-13).
-    -- Size 10 (the Archetype subtitle's size) rather than the label's 12: the box has
-    -- fixed width, and the smaller size keeps more of a long name visible while typing.
-    pcall(function()
-      local fontStruct = nil
-      -- Both known layouts read-fail on this build; log each path's actual error
-      -- once so the real field name can be identified instead of guessed (H6).
-      local candidates = {
-        { "TextStyle.Font", function() return style.TextStyle.Font end },
-        { "Font",           function() return style.Font end },
-      }
-      for _, cand in ipairs(candidates) do
-        local ok, resultOrErr = pcall(cand[2])
-        if ok and resultOrErr then
-          fontStruct = resultOrErr
-          break
-        else
-          print(string.format("[LoadoutNamer] Font path '%s': %s\n", cand[1], tostring(resultOrErr)))
-        end
-      end
-      if fontStruct then
-        -- Each write logged separately: the path READS fine but the writes were
-        -- failing silently inside the enclosing pcall (2026-07-13 log).
-        local sizeOk, sizeErr = pcall(function() fontStruct.Size = 10.0 end)
-        if not sizeOk then
-          print("[LoadoutNamer] Font Size write failed: " .. tostring(sizeErr) .. "\n")
-        end
-        local fobOk, fobErr = pcall(function()
-          local font = StaticFindObject(EDIT_FONT_PATH)
-          if font and font:IsValid() then
-            fontStruct.FontObject = font
-          end
-        end)
-        if not fobOk then
-          print("[LoadoutNamer] FontObject write failed: " .. tostring(fobErr) .. "\n")
-        end
-        -- Write the font struct back up the chain in case reading it detached a copy
-        -- (colors didn't need this, but they're one level shallower).
-        pcall(function() style.TextStyle.Font = fontStruct end)
-        fontApplied = sizeOk or fobOk
-      end
-    end)
-
-    -- Typed text color: ashen gray, brighter than the label's 0.7 so it stands out
-    -- against the near-black box fill (user-tuned).
-    pcall(function()
-      local _ = style.ForegroundColor.SpecifiedColor.R
-      setSlateColor(style.ForegroundColor, 0.85, 0.85, 0.85, 1.0)
-      pcall(function() setSlateColor(style.FocusedForegroundColor, 0.85, 0.85, 0.85, 1.0) end)
-      fgApplied = true
-    end)
-
-    -- Background: tint the engine's white rounded-box brush dark and translucent so
-    -- the box reads as part of the tile in all three interaction states.
-    pcall(function()
-      local _ = style.BackgroundImageNormal.TintColor.SpecifiedColor.R
-      setSlateColor(style.BackgroundImageNormal.TintColor, 0.02, 0.02, 0.02, 0.85)
-      pcall(function() setSlateColor(style.BackgroundImageHovered.TintColor, 0.04, 0.04, 0.04, 0.9) end)
-      pcall(function() setSlateColor(style.BackgroundImageFocused.TintColor, 0.04, 0.04, 0.04, 0.9) end)
-      bgApplied = true
-    end)
-
-    box.WidgetStyle = style -- write the mutated struct back onto the widget
-    writtenBack = true
-    editBoxStyleSupported = true
-  end)
-
-  if firstAttempt then
-    print(string.format("[LoadoutNamer] Edit box styling: font=%s, text-color=%s, background=%s, write-back=%s.\n",
-      fontApplied and "ok" or "skipped", fgApplied and "ok" or "skipped", bgApplied and "ok" or "skipped",
-      writtenBack and "ok" or "FAILED"))
+local editStyleLogged = false
+local function styleEditBox(box, sourceLabel)
+  local ok, err = pcall(function() styles.editor(box, gameFont(sourceLabel)) end)
+  if not ok then
+    runtime.log("Rename-editor styling failed: " .. tostring(err))
+  elseif not editStyleLogged then
+    editStyleLogged = true
+    runtime.log("Rename-editor scalar styling applied.")
   end
 end
 
@@ -896,7 +756,7 @@ local function beginRename(tile, recordIndex)
       -- Raw write is fine here: MinimumDesiredWidth feeds desired-size computation each
       -- frame, and a failed/ignored write just means a narrower box.
       pcall(function() box.MinimumDesiredWidth = 130.0 end)
-      styleEditBox(box) -- before AddChild: Slate builds the box with these values
+      styleEditBox(box, tile.Label) -- before AddChild: Slate builds with these values
 
       -- Blank the tile's label and stop it reserving width, THEN add the box - it
       -- takes the label's place in the title row. The subtitle stays visible below.

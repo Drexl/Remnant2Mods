@@ -28,16 +28,13 @@ interchangeable — pick based on whether you also use asset/pak mods:
 |---|---|---|
 | **Use this if...** | You don't use `AllowModsMod` ("Allow Asset Mods") or other pak-based asset mods. | You use `AllowModsMod` or other asset/pak mods — they require the stable ABI and will fail to load (or crash) on experimental-latest. |
 | **Mod folder location** | `<Remnant2>\Binaries\Win64\ue4ss\Mods\` | `<Remnant2>\Binaries\Win64\Mods\` (no `ue4ss` subfolder) |
-| MoreLoadoutSlots | Full native behavior. | Fully functional via an automatic fallback path, including the first Loadouts-screen open after launch. |
-| LoadoutNamer | Full native behavior, fully styled. | Fully functional, but the rename text box and the tooltip's "F2 Rename" text use the plain engine look instead of the game's styled font/colors. Purely cosmetic. |
+| MoreLoadoutSlots | Full native behavior. | 20 slots on the first screen open, using the Lua interaction fallback. |
+| LoadoutNamer | Full native behavior, fully styled. | Styled rename editor and tooltip prompt. |
 | EquipmentSearch | Full native behavior. | Fully functional, filtering works identically. |
 
 Everything above is handled automatically — there's no setting to flip. Just
 install the matching UE4SS build for your situation and the mods detect and
 adapt to it on their own.
-
-If you're not using any asset/pak mods, experimental-latest is the simpler
-choice with no cosmetic caveats.
 
 ## Installation
 

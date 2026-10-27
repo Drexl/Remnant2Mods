@@ -48,11 +48,8 @@ on its own with the vanilla 8-slot panel.
 - The reserved "Last Gear State" auto-save slot can't be renamed.
 - The edit box is a styled engine text box — close to the game's look, but
   not pixel-identical.
-- **On stable UE4SS only**: the rename text box and the tooltip's "F2 Rename"
-  text fall back to the plain engine font/color instead of the game's styled
-  look (cosmetic only — renaming still works fully). You may also see repeated
-  harmless log lines about the rename prompt on stable; this doesn't affect
-  gameplay.
+- Stable UE4SS may log repeated rename-prompt messages while older tooltip
+  instances remain valid.
 
 ## License
 

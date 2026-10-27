@@ -503,6 +503,8 @@ Supersedes 3.6a's "filtering should Just Work" hope. All confirmed against live 
 
 ### 3.7 Stable UE4SS + AllowModsMod compatibility investigation (2026-07-14) — three capability gaps found and gated
 
+The loadout limitations below are historical. See the [current compatibility table](../README.md#which-ue4ss-build-should-i-use).
+
 Trigger: most Remnant 2 modders run `AllowModsMod`/AAM for asset/pak mods, which requires stable UE4SS (its bundled C++ `main.dll` crashes UE4SS boot against `experimental-latest`'s ABI — the reason we're on experimental at all, §3.4u). Investigated whether the three shipped mods could also run on stable UE4SS instead of requiring users to disable AllowModsMod.
 
 **AllowModsMod itself is a moving target, unrelated to our code.** A mid-2026 Remnant 2 patch broke AllowModsMod independently (community-confirmed: crashes on boot, fixed by a subsequent AAM update). Its Nexus "latest" download's own bundled `UE4SS.log` is dated 2024-09-28, so "latest AAM" does not mean "latest UE4SS" — chasing an exact AAM+UE4SS version combination is not a fixed target. Directly observed in our own testing (both against the 2024 project backup and against that Nexus download's bundled files, run separately): `[AllowModsMod]: Delegate not found. Unable to patch.` — it never fully initializes against the current game version in either case, independent of anything in this project. None of this is required to answer the question that actually matters: **does our own code degrade safely on any UE4SS build that lacks a capability, instead of crashing?**
@@ -532,7 +534,7 @@ Trigger: most Remnant 2 modders run `AllowModsMod`/AAM for asset/pak mods, which
 
 **Bottom line**: with the capability-gating fix, all three mods are now safe to run on stable UE4SS (no crash, functional degradation only), making stable+AllowModsMod support a real option again if wanted — subject to the two accepted quirks above and AllowModsMod's own independent compatibility churn.
 
-### 3.8 First-launch `NotifyOnNewObject` quirk (§3.4k/3.4t/3.7) — likely root cause identified via UE4SS upstream history, no fix on stable yet
+### 3.8 First-launch `NotifyOnNewObject` quirk, historical investigation
 
 Web research (2026-07-17) into why this quirk reproduces on stable but not experimental, and whether an upstream or Lua-side fix exists.
 
@@ -555,7 +557,7 @@ Web research (2026-07-17) into why this quirk reproduces on stable but not exper
 
 Sources: [PR #1134](https://github.com/UE4SS-RE/RE-UE4SS/pull/1134), [RE-UE4SS Releases](https://github.com/UE4SS-RE/RE-UE4SS/releases), [NotifyOnNewObject docs](https://docs.ue4ss.com/lua-api/global-functions/notifyonnewobject.html), [FindAllOf docs](https://docs.ue4ss.com/lua-api/global-functions/findallof.html).
 
-### 3.9 Stable-UE4SS styling gap (§3.7 point 2) — alternatives investigated, none pursued (user decision 2026-07-17)
+### 3.9 Stable-UE4SS styling gap, historical alternatives
 
 Web research into whether LoadoutNamer's rename-prompt/edit-box styling (currently unstyled-engine-default on stable, §3.7) could be recovered without waiting on upstream UE4SS.
 

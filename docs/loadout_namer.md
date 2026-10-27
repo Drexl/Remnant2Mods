@@ -38,7 +38,6 @@ Status: **feature-complete and user-confirmed** as of 2026-07-13. Source: `Loado
 
 ## Key implementation facts
 
-- Cold-start setup uses `loadout_runtime.lua`: listen on resident `/Script/UMG.UserWidget`, filter for the Blueprint panel, then wait for its vanilla tiles and local owner. Registering directly on the not-yet-loaded Blueprint class misses the first screen on stable UE4SS. Keep this helper identical in both loadout mods.
 - Record indices: vanilla 0–7, mod tiles 8, 9, 11–20; **record 10 is the reserved Last Gear State auto-save** — F2 refuses it and the tooltip prompt hides on it.
 - Default labels: records ≤ 10 regenerate natively from an empty override; records > 10 must get back MoreLoadoutSlots' pinned `"Loadout N"` (N = record index) when a custom name is removed.
 - Hover identity comes from the `Widget_Loadout_C` OnMouseEnter bound-event hook (`..._4_OnAdvButtonClickedEvent...`); the hook body only does `self:get()` + an `Index` property read.
@@ -50,7 +49,6 @@ Status: **feature-complete and user-confirmed** as of 2026-07-13. Source: `Loado
 
 - U/J/O/P/B menu hotkeys are unsuppressed and appear harmless while typing (unexplained, given T/I/M demonstrably needed suppression — see TODO.md).
 - Edit box is still an engine `EditableTextBox` with tinted default brushes — close to native, not pixel-identical (no cracked border art).
-- **Rename-prompt and edit-box styling don't apply on stable UE4SS** (font/color/background stay engine-default; the box and prompt still work fully otherwise) — stable lacks the Lua struct write-back support (`push_structproperty`) the styling code needs (root cause: research doc §3.7). Investigated whether a workaround exists (2026-07-17): no upstream fix is coming (never backported to a stable tag, and blocked by AllowModsMod's own ABI lock regardless), but two unpursued alternatives — a raw-memory-pointer bypass, and reusing an existing pre-styled game widget instead of building one — are written up in research doc §3.9. User-decided to ship without pursuing either; cosmetics-only, not worth blocking the release over.
 - Names are per-install, not per-character/save: all characters share the record-index → name map.
 - Multiplayer: rename flow untested in co-op sessions (tooltip/panel paths follow the GetOwningPlayer rule, so no known hazard — just unverified).
 - **Fixed 2026-07-17**: `suppressTabHotkeys` used to find the menu via `FindAllOf("Widget_InGameMenu_C")`, taking whichever non-`Default__` instance came last in the results, with no logging if none were found. Reported as an intermittent, unreproducible failure to hide the T/I/M tabs (typing a name containing M would navigate to the Map tab mid-rename). Root cause: `FindAllOf` has no guarantee of returning only the live on-screen instance — stale instances can linger (same GC-timing class as the tooltip per-instance-tracking issue, research doc §3.4bb) — so the "last" one picked was sometimes the wrong (or no) menu, silently.
