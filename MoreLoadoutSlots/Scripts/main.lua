@@ -329,13 +329,15 @@ local function addExtraLoadoutTile(panel)
       return false -- keep polling
     end
 
-    -- LoadoutList is valid - safe to proceed. Do the actual work inside the game thread.
+    -- On stable, the unsupported delegate read can abort its native callback
+    -- despite Lua pcall. Probe in a separate callback so the first injection
+    -- still runs, using the existing forwarding fallback when unsupported.
+    ExecuteInGameThread(function() probeMulticastDelegateSupport(list) end)
+
     ExecuteInGameThread(function()
       if not injectScrollBox(panel, list) then
         return -- without the ScrollBox, extra tiles would render below the visible panel
       end
-
-      probeMulticastDelegateSupport(list)
 
       -- Idempotency guard: this whole function can run again on a screen reopen (a fresh
       -- NotifyOnNewObject firing for a newly-constructed panel instance). Skip if the target

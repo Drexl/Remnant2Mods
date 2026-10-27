@@ -28,7 +28,7 @@ interchangeable — pick based on whether you also use asset/pak mods:
 |---|---|---|
 | **Use this if...** | You don't use `AllowModsMod` ("Allow Asset Mods") or other pak-based asset mods. | You use `AllowModsMod` or other asset/pak mods — they require the stable ABI and will fail to load (or crash) on experimental-latest. |
 | **Mod folder location** | `<Remnant2>\Binaries\Win64\ue4ss\Mods\` | `<Remnant2>\Binaries\Win64\Mods\` (no `ue4ss` subfolder) |
-| MoreLoadoutSlots | Full native behavior. | Fully functional via an automatic fallback path. First Loadouts-screen open after launch may not show the extra slots — close and reopen the screen (or hot-reload) once to fix it for the rest of the session. |
+| MoreLoadoutSlots | Full native behavior. | Fully functional via an automatic fallback path, including the first Loadouts-screen open after launch. |
 | LoadoutNamer | Full native behavior, fully styled. | Fully functional, but the rename text box and the tooltip's "F2 Rename" text use the plain engine look instead of the game's styled font/colors. Purely cosmetic. |
 | EquipmentSearch | Full native behavior. | Fully functional, filtering works identically. |
 

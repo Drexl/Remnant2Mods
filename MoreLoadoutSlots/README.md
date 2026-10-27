@@ -41,10 +41,6 @@ Raises the Character screen's loadout count from **8 to 20**.
 - Saving/equipping into an extra slot while in another player's co-op session
   is untested (should work, following the same rules as vanilla slots, but
   hasn't been verified).
-- **On stable UE4SS only**: the extra slots may not appear the very first time
-  you open the Loadouts screen after launch (a pre-existing UE4SS quirk on
-  stable, not caused by this mod) — close and reopen the screen once (or
-  hot-reload) and they'll show up for the rest of the session.
 
 ## License
 
