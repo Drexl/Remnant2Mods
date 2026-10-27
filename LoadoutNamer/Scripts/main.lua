@@ -14,7 +14,7 @@ print("[LoadoutNamer] Loaded and running.\n")
 -- refreshes; EditableTextBox injection + Text reads work; RegisterKeyBind fires in
 -- menu context; the OnMouseEnter bound-event hook gives hover identity.
 
-local PANEL_CLASS = "/Game/UI2/UI_Widgets/UI_Game/UI_Game_Character/Widget_LoadoutsPanel.Widget_LoadoutsPanel_C"
+local runtime = require("loadout_runtime").new("LoadoutNamer")
 local MOUSE_ENTER_FN = "/Game/UI2/UI_Widgets/UI_Game/UI_Game_Character/Widget_Loadout.Widget_Loadout_C:BndEvt__Widget_Loadout_Button_K2Node_ComponentBoundEvent_4_OnAdvButtonClickedEvent__DelegateSignature"
 
 -- Record 10 is the game's reserved last-gear-state auto-save (research doc 3.4w); it
@@ -1048,7 +1048,8 @@ end)
 
 -- ============================== wiring ==============================
 
-NotifyOnNewObject(PANEL_CLASS, function(panel)
+runtime.watchPanels(function(panel)
   registerHoverHook()
   applySavedNames(panel)
 end)
+runtime.start()

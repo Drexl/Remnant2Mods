@@ -1,4 +1,5 @@
 print("[MoreLoadoutSlots] Loaded and running.\n")
+local runtime = require("loadout_runtime").new("MoreLoadoutSlots")
 
 -- The one knob: total loadout slots (vanilla has 8). Drives both the LoadoutComponent
 -- record-capacity patch and how many extra tiles get added to the Loadouts screen; the
@@ -514,7 +515,8 @@ local function addExtraLoadoutTile(panel)
   end)
 end
 
-NotifyOnNewObject("/Game/UI2/UI_Widgets/UI_Game/UI_Game_Character/Widget_LoadoutsPanel.Widget_LoadoutsPanel_C", function(panel)
+runtime.watchPanels(function(panel)
   currentPanel = panel
   addExtraLoadoutTile(panel)
 end)
+runtime.start()

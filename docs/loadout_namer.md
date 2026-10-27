@@ -38,6 +38,7 @@ Status: **feature-complete and user-confirmed** as of 2026-07-13. Source: `Loado
 
 ## Key implementation facts
 
+- Cold-start setup uses `loadout_runtime.lua`: listen on resident `/Script/UMG.UserWidget`, filter for the Blueprint panel, then wait for its vanilla tiles and local owner. Registering directly on the not-yet-loaded Blueprint class misses the first screen on stable UE4SS. Keep this helper identical in both loadout mods.
 - Record indices: vanilla 0–7, mod tiles 8, 9, 11–20; **record 10 is the reserved Last Gear State auto-save** — F2 refuses it and the tooltip prompt hides on it.
 - Default labels: records ≤ 10 regenerate natively from an empty override; records > 10 must get back MoreLoadoutSlots' pinned `"Loadout N"` (N = record index) when a custom name is removed.
 - Hover identity comes from the `Widget_Loadout_C` OnMouseEnter bound-event hook (`..._4_OnAdvButtonClickedEvent...`); the hook body only does `self:get()` + an `Index` property read.
