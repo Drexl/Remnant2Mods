@@ -3,7 +3,7 @@ print("[LoadoutNamer] Loaded and running.\n")
 -- Mod #2: custom names for loadout slots.
 --   Hover a loadout tile and press the rename key (F2 by default, configurable via
 --   settings.txt) -> a text box opens in the tile's title row. Type the new name, then
---   Enter or the rename key commits; Escape cancels. Names persist per-character in
+--   Enter, the rename key, or clicking away saves; Escape cancels. Names persist in
 --   loadout_names.txt next to this mod (one "characterID<TAB>recordIndex<TAB>name"
 --   line per slot) and are re-applied every time the Loadouts panel is constructed.
 --   The hover tooltip's title also shows the (full, untruncated) name; long names
@@ -843,9 +843,7 @@ end
 -- ============================== rename session ==============================
 
 local hoveredTile = nil -- last tile the mouse entered (kept on leave - forgiving F2 timing)
-local editBox = nil     -- live EditableTextBox while a rename is in progress
-local editTile = nil
-local editIndex = nil
+local editor -- session controller, initialized below with its cleanup callback
 local hoverHookRegistered = false
 
 -- Track which tile the mouse is over. Registered lazily on first panel construction so
@@ -878,130 +876,104 @@ local function registerHoverHook()
 end
 
 local function beginRename(tile, recordIndex)
-  ExecuteInGameThread(function()
-    local ok, err = pcall(function()
-      -- Parent the box into the TITLE row (the HorizontalBox holding the Label), so the
-      -- edit happens visually where the name lives. The blanked Label would normally
-      -- squish the box by reserving its MinDesiredWidth=130 in that row, so zero it for
-      -- the duration of the edit (plain-float property write; endRename restores it).
-      local row = tile.Label:GetParent()
-      if not row or not row:IsValid() then
-        error("could not reach the tile's title row")
-      end
-
-      local box = StaticConstructObject(StaticFindObject("/Script/UMG.EditableTextBox"), tile.WidgetTree)
-      if not box or not box:IsValid() then
-        error("failed to construct the EditableTextBox")
-      end
-      -- Raw write is fine here: MinimumDesiredWidth feeds desired-size computation each
-      -- frame, and a failed/ignored write just means a narrower box.
-      pcall(function() box.MinimumDesiredWidth = 130.0 end)
-      styleEditBox(box) -- before AddChild: Slate builds the box with these values
-
-      -- Blank the tile's label and stop it reserving width, THEN add the box - it
-      -- takes the label's place in the title row. The subtitle stays visible below.
-      -- MinDesiredWidth is a LAYOUT property: the real SetMinDesiredWidth setter is
-      -- mandatory, a raw write doesn't invalidate Slate layout (H4 - the raw write
-      -- indeed changed nothing, 2026-07-13 test).
-      writeLabel(tile, " ")
-      local widthOk, widthErr = pcall(function() tile.Label:SetMinDesiredWidth(0.0) end)
-      if not widthOk then
-        print("[LoadoutNamer] WARNING: failed to release the tile label's reserved width - the edit box may render squeezed: " .. tostring(widthErr) .. "\n")
-      end
-      row:AddChild(box)
-
-      editBox = box
-      editTile = tile
-      editIndex = recordIndex
-
-      -- Typing T/I/M must not yank the menu to another tab mid-edit.
-      suppressTabHotkeys()
-    end)
-    if ok then
-      print(string.format("[LoadoutNamer] Renaming slot (record %d) - click the box, type the new name, then Enter/%s to commit or Escape to cancel. Committing an empty name removes the custom name.\n", recordIndex, renameKeyName))
-    else
-      print("[LoadoutNamer] FAILED to open the rename box: " .. tostring(err) .. "\n")
+  editor.open({tile = tile, index = recordIndex, characterID = characterKey()}, function(session)
+    -- Parent the editor into the title row, in place of the label.
+    local row = tile.Label:GetParent()
+    if not row or not row:IsValid() then
+      error("could not reach the tile's title row")
     end
+    local box = StaticConstructObject(StaticFindObject("/Script/UMG.EditableTextBox"), tile.WidgetTree)
+    if not box or not box:IsValid() then
+      error("failed to construct the EditableTextBox")
+    end
+    session.box = box -- cleanup can recover a partially opened editor
+    box.Text = FText(getName(recordIndex) or "")
+    box.SelectAllTextWhenFocused = true
+    pcall(function() box.MinimumDesiredWidth = 130.0 end)
+    styleEditBox(box) -- before AddChild: Slate builds the box with these values
+
+    writeLabel(tile, " ")
+    local widthOk, widthErr = pcall(function() tile.Label:SetMinDesiredWidth(0.0) end)
+    if not widthOk then
+      print("[LoadoutNamer] WARNING: failed to release the tile label's reserved width: " .. tostring(widthErr) .. "\n")
+    end
+    local slot = row:AddChild(box)
+    assert(slot and slot:IsValid(), "could not attach the rename box")
+    suppressTabHotkeys()
+    print(string.format("[LoadoutNamer] Renaming record %d - type, then Enter/%s or click away to save; Escape cancels. An empty name removes the custom name.\n", recordIndex, renameKeyName))
   end)
 end
 
-local function endRename(commit)
-  ExecuteInGameThread(function()
-    local box, tile, idx = editBox, editTile, editIndex
-    editBox, editTile, editIndex = nil, nil, nil
+-- Called once per session, on the game thread, including failed/abandoned opens.
+local function closeRename(session, commit)
+  local box, tile, idx = session.box, session.tile, session.index
+  restoreTabHotkeys()
 
-    restoreTabHotkeys()
-
-    local text = ""
-    local textOk, textErr = pcall(function() text = box.Text:ToString() end)
-    if commit and not textOk then
-      print("[LoadoutNamer] WARNING: could not read the edit box's text on commit - treating as empty (name will be removed): " .. tostring(textErr) .. "\n")
-    end
-
-    local removeOk, removeErr = pcall(function()
-      local parent = box:GetParent()
-      if parent and parent:IsValid() then
-        parent:RemoveChild(box)
-      end
+  local text = ""
+  if commit then
+    local textOk, textErr = pcall(function()
+      assert(box and box:IsValid(), "rename box is unavailable")
+      text = box.Text:ToString()
     end)
-    if not removeOk then
-      print("[LoadoutNamer] WARNING: failed to remove the edit box from the tile - it may linger visually: " .. tostring(removeErr) .. "\n")
+    if not textOk then
+      commit = false -- never turn an unreadable/dead editor into a deleted name
+      print("[LoadoutNamer] WARNING: could not read the rename text; keeping the old name: " .. tostring(textErr) .. "\n")
+    elseif session.characterID ~= characterKey() then
+      commit = false
+      print("[LoadoutNamer] Character changed during rename; keeping the old name.\n")
     end
+  end
 
-    if not tile or not tile:IsValid() then
-      return -- screen closed mid-edit; the next apply pass restores labels anyway
+  local removeOk, removeErr = pcall(function()
+    if box and box:IsValid() then
+      local parent = box:GetParent()
+      if parent and parent:IsValid() then parent:RemoveChild(box) end
     end
-
-    -- Give the label its reserved title-row width back (zeroed for the edit).
-    -- Real setter, not a raw write - layout property (H4).
-    local widthOk, widthErr = pcall(function() tile.Label:SetMinDesiredWidth(130.0) end)
-    if not widthOk then
-      print("[LoadoutNamer] WARNING: failed to restore the tile label's width after a rename - the title row may look squeezed: " .. tostring(widthErr) .. "\n")
-    end
-
-    if not commit then
-      applyRestingLabel(tile, idx)
-      print("[LoadoutNamer] Rename cancelled.\n")
-      return
-    end
-
-    -- Trim and strip characters that would corrupt the tab-separated store.
-    text = text:gsub("[\t\r\n]", ""):match("^%s*(.-)%s*$")
-
-    if #text > MAX_NAME_LENGTH then
-      print(string.format("[LoadoutNamer] Name truncated to %d characters (the storage cap; the tile shows the first %d with '..', the tooltip shows the rest).\n", MAX_NAME_LENGTH, TILE_LABEL_MAX))
-      text = text:sub(1, MAX_NAME_LENGTH):match("^(.-)%s*$")
-    end
-
-    if text == "" then
-      clearName(idx)
-      saveNames()
-      applyRestingLabel(tile, idx)
-      print(string.format("[LoadoutNamer] Custom name removed from record %d - back to its default label.\n", idx))
-    else
-      setName(idx, text)
-      saveNames()
-      applyRestingLabel(tile, idx)
-      print(string.format("[LoadoutNamer] Record %d named '%s' (saved).\n", idx, text))
-    end
-
-    -- If the tooltip is on screen right now (mouse is still over the tile), bring its
-    -- title in line with the new name immediately.
-    scheduleTooltipTitle(idx)
   end)
+  if not removeOk then
+    print("[LoadoutNamer] WARNING: failed to remove the edit box: " .. tostring(removeErr) .. "\n")
+  end
+
+  if not tile or not tile:IsValid() then return end
+  local widthOk, widthErr = pcall(function() tile.Label:SetMinDesiredWidth(130.0) end)
+  if not widthOk then
+    print("[LoadoutNamer] WARNING: failed to restore the tile label's width: " .. tostring(widthErr) .. "\n")
+  end
+  if not commit then
+    applyRestingLabel(tile, idx)
+    print("[LoadoutNamer] Rename cancelled.\n")
+    return
+  end
+
+  -- Trim and strip characters that would corrupt the tab-separated store.
+  text = text:gsub("[\t\r\n]", ""):match("^%s*(.-)%s*$")
+  if #text > MAX_NAME_LENGTH then
+    print(string.format("[LoadoutNamer] Name truncated to %d characters (the storage cap; the tile shows the first %d with '..', the tooltip shows the rest).\n", MAX_NAME_LENGTH, TILE_LABEL_MAX))
+    text = text:sub(1, MAX_NAME_LENGTH):match("^(.-)%s*$")
+  end
+
+  if text == "" then
+    clearName(idx)
+    print(string.format("[LoadoutNamer] Custom name removed from record %d.\n", idx))
+  else
+    setName(idx, text)
+    print(string.format("[LoadoutNamer] Record %d named '%s' (saved).\n", idx, text))
+  end
+  saveNames()
+  applyRestingLabel(tile, idx)
+  scheduleTooltipTitle(idx)
+end
+
+editor = require("rename_session").new(closeRename, function(message)
+  print("[LoadoutNamer] " .. message .. "\n")
+end)
+
+local function endRename(commit)
+  editor.finish(commit)
 end
 
 local function editSessionActive()
-  if not editBox then
-    return false
-  end
-  local ok, alive = pcall(function() return editBox:IsValid() end)
-  if ok and alive then
-    return true
-  end
-  editBox, editTile, editIndex = nil, nil, nil -- box died with the screen
-  ExecuteInGameThread(restoreTabHotkeys) -- belt-and-braces; menu reopen resets these anyway
-  return false
+  return editor.active()
 end
 
 -- ============================== keybinds ==============================
@@ -1045,6 +1017,11 @@ RegisterKeyBind(Key.ESCAPE, function()
     endRename(false)
   end
 end)
+
+-- Some UI clicks do not move keyboard focus. Still finish the edit when the
+-- pointer is outside its box, without intercepting the normal save/equip click.
+RegisterKeyBind(Key.LEFT_MOUSE_BUTTON, function() editor.pointerPressed() end)
+RegisterKeyBind(Key.RIGHT_MOUSE_BUTTON, function() editor.pointerPressed() end)
 
 -- ============================== wiring ==============================
 

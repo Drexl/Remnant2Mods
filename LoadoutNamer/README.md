@@ -4,9 +4,9 @@ Custom names for your loadout slots on the Character screen.
 
 ## What it does
 
-- Hover a loadout tile and press **F2** — a text box opens right in the
-  tile's title. Type a name, then **Enter** or **F2** to save it, **Escape**
-  to cancel.
+- Hover a loadout tile and press **F2** — a focused text box opens right in
+  the tile's title, with any existing custom name selected. Type a name,
+  then **Enter**, **F2**, or **click outside** to save it; **Escape** cancels.
 - Committing an empty name removes the custom name and restores the default
   ("Loadout N").
 - The tile shows up to 18 characters (truncated with `..`); hovering shows
