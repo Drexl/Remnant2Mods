@@ -599,72 +599,94 @@ local function registerHooksOnce()
     end
 end
 
--- Widget capture skeleton (proven in MoreLoadoutSlots/LoadoutNamer): notify on
--- construction, poll until children are initialized, then do widget work on
--- the game thread. The visibility gate binding fires a few times during
--- construction, so we apply once the filter child reports valid; the binding
--- is inert afterwards and our write sticks.
-NotifyOnNewObject(LIST_CLASS_PATH, function(list)
-    local attempts = 0
-    local MAX_ATTEMPTS = 40 -- ~2s at 50ms per attempt
+-- Stable v3.0.1 resolves NotifyOnNewObject's class at registration time;
+-- LIST_CLASS_PATH may not be loaded yet on a cold launch. Watch the resident
+-- native ancestor instead, as in the loadout mods, and discard unrelated
+-- widgets immediately. No global discovery scan or hot-reload is required.
+local LIST_CLASS_NAME = "Widget_InventoryList_C"
+local TEMPLATE_FLAGS = 0x30 -- RF_ClassDefaultObject | RF_ArchetypeObject
+local listStates = {}
+local baseWidget = StaticFindObject("/Script/UMG.UserWidget")
+assert(baseWidget and baseWidget:IsValid(), "native UserWidget class is unavailable")
+
+NotifyOnNewObject("/Script/UMG.UserWidget", function(list)
+    if not list or not list:IsValid() then return end
+    if list:GetClass():GetFName():ToString() ~= LIST_CLASS_NAME then return end
+    if list:HasAnyFlags(TEMPLATE_FLAGS) then return end
+    if list:GetFullName():find("Default__", 1, true) then return end
+
+    -- Keep pending and completed instances deduplicated, but allow a new
+    -- instance to reuse an address after the previous widget is destroyed.
+    for id, state in pairs(listStates) do
+        if not state.list:IsValid() then listStates[id] = nil end
+    end
+    local id = list:GetAddress()
+    if listStates[id] then return end
+    local state = {list = list, attempts = 0, queued = false, done = false}
+    listStates[id] = state
 
     LoopAsync(50, function()
-        attempts = attempts + 1
-
-        -- cheap readiness check: keep polling until the filter child and its
-        -- text box are initialized
-        local ready = false
-        local okCheck = pcall(function()
-            if list:IsValid() then
-                local filter = list.Widget_InventorySearchFilter
-                if filter and filter:IsValid() then
-                    local box = filter.SearchFilterText
-                    ready = box and box:IsValid()
+        if state.done then return true end
+        -- A stalled game thread must not accumulate readiness callbacks.
+        if not state.queued then
+            state.queued = true
+            ExecuteInGameThread(function()
+                state.queued = false
+                if state.done then return end
+                state.attempts = state.attempts + 1
+                if not list:IsValid() then
+                    state.done = true
+                    listStates[id] = nil
+                    return
                 end
-            end
-        end)
+                -- All child/owner reads and widget work stay on the game thread.
+                local ok, err = pcall(function()
+                    local filter = list.Widget_InventorySearchFilter
+                    if not filter or not filter:IsValid() then return end
+                    local box = filter.SearchFilterText
+                    if not box or not box:IsValid() then return end
+                    local player = list:GetOwningPlayer()
+                    if not player or not player:IsValid() then return end
 
-        if not okCheck or not ready then
-            if attempts >= MAX_ATTEMPTS then
-                print("[EquipmentSearch] Gave up waiting for the search filter child "
-                    .. "to initialize (" .. attempts .. " polls) - bar not enabled "
-                    .. "for this screen.\n")
-                return true -- stop looping
-            end
-            return false -- keep polling
-        end
-
-        -- children ready - do the widget work on the game thread
-        ExecuteInGameThread(function()
-            local ok, err = pcall(function()
-                local shown, boxOrWhy = showSearchBar(list)
-                if shown then
+                    local shown, boxOrWhy = showSearchBar(list)
+                    state.done = true
+                    if not shown then
+                        print("[EquipmentSearch] Search bar NOT enabled: "
+                            .. tostring(boxOrWhy) .. "\n")
+                        return
+                    end
                     trackedLists[list:GetFullName()] = {
                         list = list, box = boxOrWhy, query = "",
                     }
                     registerHooksOnce()
                     print("[EquipmentSearch] Search bar enabled on "
                         .. list:GetFullName() .. "\n")
-                    -- the CanSeeSearchBar binding still evaluates a few times
-                    -- during construction and could stomp an early write - one
-                    -- delayed re-apply covers that window (it's inert after)
+                    -- CanSeeSearchBar may stomp an early visibility write;
+                    -- preserve the existing one-shot construction-time reapply.
                     LoopAsync(500, function()
                         ExecuteInGameThread(function()
-                            pcall(function()
+                            local okReapply, reapplyErr = pcall(function()
                                 if list:IsValid() then showSearchBar(list) end
                             end)
+                            if not okReapply then
+                                print("[EquipmentSearch] Search bar reapply error: "
+                                    .. tostring(reapplyErr) .. "\n")
+                            end
                         end)
-                        return true -- one-shot
+                        return true
                     end)
-                else
-                    print("[EquipmentSearch] Search bar NOT enabled: "
-                        .. tostring(boxOrWhy) .. "\n")
+                end)
+                if not ok then
+                    state.done = true
+                    print("[EquipmentSearch] List setup failed: " .. tostring(err) .. "\n")
+                elseif not state.done and state.attempts >= 40 then
+                    state.done = true
+                    print("[EquipmentSearch] List readiness timed out; bar not enabled: "
+                        .. list:GetFullName() .. "\n")
                 end
             end)
-            if not ok then
-                print("[EquipmentSearch] showSearchBar error: " .. tostring(err) .. "\n")
-            end
-        end)
-        return true -- stop looping
+        end
+        return state.done
     end)
 end)
+print("[EquipmentSearch] Native widget listener started (no global discovery scans).\n")

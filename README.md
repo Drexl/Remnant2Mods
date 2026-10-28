@@ -30,7 +30,7 @@ interchangeable — pick based on whether you also use asset/pak mods:
 | **Mod folder location** | `<Remnant2>\Binaries\Win64\ue4ss\Mods\` | `<Remnant2>\Binaries\Win64\Mods\` (no `ue4ss` subfolder) |
 | MoreLoadoutSlots | Full native behavior. | Fully functional via an automatic fallback path. First Loadouts-screen open after launch may not show the extra slots — close and reopen the screen (or hot-reload) once to fix it for the rest of the session. |
 | LoadoutNamer | Full native behavior, fully styled. | Fully functional, but the rename text box and the tooltip's "F2 Rename" text use the plain engine look instead of the game's styled font/colors. Purely cosmetic. |
-| EquipmentSearch | Full native behavior. | Fully functional, filtering works identically. |
+| EquipmentSearch | Full native behavior. | Filtering works identically. Native-widget startup listener verified on a cold first equipment-screen open. Earlier builds can require one hot-reload after launch. |
 
 Everything above is handled automatically — there's no setting to flip. Just
 install the matching UE4SS build for your situation and the mods detect and
