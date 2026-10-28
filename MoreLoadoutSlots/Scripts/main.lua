@@ -1,4 +1,5 @@
 print("[MoreLoadoutSlots] Loaded and running.\n")
+local vanillaScrollBox = require("vanilla_scrollbox")
 
 -- The one knob: total loadout slots (vanilla has 8). Drives both the LoadoutComponent
 -- record-capacity patch and how many extra tiles get added to the Loadouts screen; the
@@ -262,8 +263,15 @@ local function injectScrollBox(panel, list)
   end
 
   local constructOk, scrollBox = pcall(function()
-    return StaticConstructObject(scrollClass, panel.WidgetTree)
-  end)
+    local nativeOk, result = pcall(vanillaScrollBox.create, scrollClass, panel.WidgetTree)
+    if nativeOk then
+      print("[MoreLoadoutSlots] Using the vanilla advanced-stats ScrollBox template.\n")
+      return result
+    end
+    -- A game update may rename the template. Keep extra slots usable, but log
+    -- clearly that the vanilla appearance/behavior could not be inherited.
+    print("[MoreLoadoutSlots] Vanilla scrollbar unavailable; using the engine default: " .. tostring(result) .. "\n")
+    return StaticConstructObject(scrollClass, panel.WidgetTree)  end)
   if not constructOk or not scrollBox or not scrollBox:IsValid() then
     print("[MoreLoadoutSlots] FAILED to construct a ScrollBox widget: " .. tostring(scrollBox) .. "\n")
     return false
