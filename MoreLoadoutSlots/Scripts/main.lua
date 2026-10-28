@@ -231,10 +231,10 @@ end
 -- Wrap the panel's tile container (LoadoutList) in a runtime-created ScrollBox so more tiles
 -- than the panel's fixed 688px can hold stay reachable by scrolling. The vanilla widget tree
 -- is SizeBox_0 (fixed height) -> LoadoutList (VerticalBox); we splice a ScrollBox between
--- them: SizeBox_0 -> ScrollBox -> LoadoutList. A plain engine ScrollBox is safe to build with
--- StaticConstructObject - unlike the Blueprint tile widget, it's a raw C++ widget with no
--- Initialize()-time delegate bindings to miss (the thing that forced tiles onto
--- WidgetBlueprintLibrary.Create).
+-- them: SizeBox_0 -> Overlay -> ScrollBox -> LoadoutList. The Overlay expands the
+-- viewport 24px left to include the game's equipped icon (its native left padding
+-- is -24); matching inner padding keeps the tiles in their original positions.
+-- Both injected widgets are plain engine widgets, safe to StaticConstructObject.
 local function injectScrollBox(panel, list)
   -- Already inside a ScrollBox? (Each screen-open builds a fresh panel, so this normally
   -- can't happen - cheap guard against the callback somehow running twice for one panel.)
@@ -269,17 +269,41 @@ local function injectScrollBox(panel, list)
     return false
   end
 
-  local spliceOk, spliceErr = pcall(function()
-    sizeBox:RemoveChild(list)
-    sizeBox:AddChild(scrollBox)
-    scrollBox:AddChild(list)
+  local frameOk, frame = pcall(function()
+    local frameClass = StaticFindObject("/Script/UMG.Overlay")
+    return StaticConstructObject(frameClass, panel.WidgetTree)
   end)
-  if not spliceOk then
-    print("[MoreLoadoutSlots] FAILED to splice the ScrollBox into the widget tree: " .. tostring(spliceErr) .. "\n")
+  if not frameOk or not frame or not frame:IsValid() then
+    print("[MoreLoadoutSlots] FAILED to construct the ScrollBox frame: " .. tostring(frame) .. "\n")
     return false
   end
 
-  print("[MoreLoadoutSlots] ScrollBox injected between the panel's SizeBox and LoadoutList.\n")
+  local spliceOk, spliceErr = pcall(function()
+    sizeBox:RemoveChild(list)
+    local listSlot = scrollBox:AddChild(list)
+    listSlot.Padding.Left = 24
+    local scrollSlot = frame:AddChild(scrollBox)
+    scrollSlot.Padding.Left = -24
+    -- Configure both slots BEFORE attaching the frame to the live tree: Slate
+    -- copies their padding when built. Scalar writes avoid struct arguments.
+    local frameSlot = sizeBox:AddChild(frame)
+    assert(frameSlot and frameSlot:IsValid(), "could not attach ScrollBox frame")
+  end)
+  if not spliceOk then
+    print("[MoreLoadoutSlots] FAILED to splice the ScrollBox into the widget tree: " .. tostring(spliceErr) .. "\n")
+    local restored, restoreErr = pcall(function()
+      list:RemoveFromParent()
+      sizeBox:RemoveChild(frame)
+      local slot = sizeBox:AddChild(list)
+      assert(slot and slot:IsValid(), "could not restore original tile list")
+    end)
+    if not restored then
+      print("[MoreLoadoutSlots] FAILED to restore the original tile list: " .. tostring(restoreErr) .. "\n")
+    end
+    return false
+  end
+
+  print("[MoreLoadoutSlots] ScrollBox injected with a 24px equipped-icon gutter; viewport clipping retained.\n")
   return true
 end
 
