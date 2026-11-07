@@ -43,16 +43,15 @@ function M.new(modName)
     return hook
   end
 
-  -- Address reuse after garbage collection is detected by the unique full name.
+  -- Keep only scalar metadata. A Lua UObject wrapper does not retain its panel.
+  -- Read the name only from the live callback context, never from old panels.
+  -- Address reuse is detected by the unique full name.
   local function stateFor(panel)
-    for id, state in pairs(panelStates) do
-      if not state.panel:IsValid() then panelStates[id] = nil end
-    end
     local id, name = panel:GetAddress(), panel:GetFullName()
     local state = panelStates[id]
     if state and state.name ~= name then state = nil end
     if not state then
-      state = {panel = panel, name = name, done = false, attempts = 0}
+      state = {name = name, done = false, attempts = 0}
       panelStates[id] = state
     end
     return state
