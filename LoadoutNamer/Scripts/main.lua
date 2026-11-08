@@ -16,7 +16,9 @@ print("[LoadoutNamer] Loaded and running.\n")
 
 local runtime = require("loadout_runtime").new("LoadoutNamer")
 local styles = require("loadout_style")
+local tick = require("game_tick").new(runtime.log)
 local MOUSE_ENTER_FN = "/Game/UI2/UI_Widgets/UI_Game/UI_Game_Character/Widget_Loadout.Widget_Loadout_C:BndEvt__Widget_Loadout_Button_K2Node_ComponentBoundEvent_4_OnAdvButtonClickedEvent__DelegateSignature"
+local TILE_CONSTRUCT_FN = "/Game/UI2/UI_Widgets/UI_Game/UI_Game_Character/Widget_Loadout.Widget_Loadout_C:Construct"
 
 -- Record 10 is the game's reserved last-gear-state auto-save (research doc 3.4w); it
 -- renders as the hoverable "Last Gear State" tile on the character screen (3.4z).
@@ -46,12 +48,6 @@ local EDIT_FONT_PATH = "/Game/UI/Fonts/GFGRemnantCracked_Font.GFGRemnantCracked_
 -- The game's reusable key-glyph widget (dev-data/Widget_KeyIcon.json): Background image
 -- + KeyText TextBlock. Used for the tooltip's "F2 Rename" prompt.
 local KEYICON_CLASS_PATH = "/Game/UI/UI_Widgets/Widget_KeyIcon.Widget_KeyIcon_C"
-
--- MoreLoadoutSlots builds the panel out to 20 tiles; waiting for that count sequences
--- our apply-names pass after its label pass with no explicit coordination (3.4y).
--- If that mod is ever disabled, the 8-tile vanilla panel would time the poll out - the
--- fallback below then applies names to however many tiles exist.
-local EXPECTED_TILES = 20
 
 -- ============================== name store ==============================
 
@@ -391,39 +387,18 @@ local function applyNamesToCount(panel, count)
   end
 end
 
--- MoreLoadoutSlots injects its extra tiles synchronously - one panel-construction poll
--- cycle takes the tile count straight from 8 to EXPECTED_TILES in a single tick, it
--- never grows gradually (see MoreLoadoutSlots/Scripts/main.lua addExtraLoadoutTile).
--- So there's nothing to "wait until it's safe" for: apply on the very first tick to
--- whatever tile count already exists (instant in the common case, including without
--- MoreLoadoutSlots), then keep polling only to catch a LATER count change (that mod
--- present but still mid-injection) and redo the pass when it happens. Previously this
--- blocked the first apply on reaching EXPECTED_TILES, which without MoreLoadoutSlots
--- (vanilla 8-tile panel, count never reaches it) burned the full ~4s timeout on every
--- panel construction before applying anything - the couple-second delay reported
--- 2026-07-17.
+-- MoreLoadoutSlots adds its tiles inside the same panel Construct, before or after
+-- this mod's readiness hook depending on hook registration order. The panel pass
+-- resolves the character and names every tile present. Each tile's own Construct
+-- then names tiles added later to that list. Tiles constructed before the panel pass
+-- are skipped there, so a character switch never applies the previous character's
+-- names. Full names identify the list, which survives address reuse.
+local readyListName = nil
+
 local function applySavedNames(panel)
-  local attempts = 0
-  local MAX_ATTEMPTS = 80 -- ~4s safety cap on how long to keep watching for a late count change
-  local lastAppliedCount = -1
-
-  LoopAsync(50, function()
-    attempts = attempts + 1
-
-    local countOk, count = pcall(function() return panel.LoadoutList:GetChildrenCount() end)
-    local haveList = countOk and count and count > 0
-
-    if not haveList then
-      return attempts >= MAX_ATTEMPTS -- benign non-UI panel instance; nothing to do
-    end
-
-    if count ~= lastAppliedCount then
-      lastAppliedCount = count
-      ExecuteInGameThread(function() applyNamesToCount(panel, count) end)
-    end
-
-    return count >= EXPECTED_TILES or attempts >= MAX_ATTEMPTS
-  end)
+  local list = panel.LoadoutList
+  applyNamesToCount(panel, list:GetChildrenCount())
+  readyListName = list:GetFullName()
 end
 
 -- ============================== tooltip rename prompt ==============================
@@ -546,13 +521,15 @@ end
 local tooltipGen = 0
 
 local function scheduleTooltipTitle(recordIndex)
+  if not tick.installed() then return end -- never queue work nothing will run
   tooltipGen = tooltipGen + 1
   local gen = tooltipGen
   local title = getName(recordIndex) or TOOLTIP_DEFAULT_TITLE
   local attempts = 0
   local logged = false
 
-  LoopAsync(50, function()
+  -- Runs on HUD ticks, so discovery and widget writes share the game thread.
+  tick.loop(50, function()
     if gen ~= tooltipGen then
       return true -- a newer hover superseded this poll
     end
@@ -565,17 +542,8 @@ local function scheduleTooltipTitle(recordIndex)
           -- Skip the class-default object: writing its template would leak the
           -- title into every future tooltip instance.
           if tt:IsValid() and not tt:GetFullName():find("Default__") then
-            ExecuteInGameThread(function()
-              -- The hover may have moved on between this callback being queued and the
-              -- game thread actually running it - re-check so a stale generation doesn't
-              -- still do work (and doesn't add to how many of these can be in flight at
-              -- once when the mouse sweeps quickly across several tiles).
-              if gen ~= tooltipGen then
-                return
-              end
-              pcall(function() tt.ItemLabel:SetText(FText(title)) end)
-              ensureRenamePrompt(tt, recordIndex)
-            end)
+            pcall(function() tt.ItemLabel:SetText(FText(title)) end)
+            ensureRenamePrompt(tt, recordIndex)
             if not logged then
               logged = true
               print(string.format("[LoadoutNamer] Tooltip title set for record %d ('%s').\n", recordIndex, title))
@@ -705,11 +673,37 @@ end
 local hoveredTile = nil -- last tile the mouse entered (kept on leave - forgiving F2 timing)
 local editor -- session controller, initialized below with its cleanup callback
 local hoverHookRegistered = false
+local tileConstructHookRegistered = false
 
--- Track which tile the mouse is over. Registered lazily on first panel construction so
--- Widget_Loadout_C is guaranteed loaded. Hazards respected: self:get() only (H3), read
--- cached properties only, no native calls in the hook body (H8).
-local function registerHoverHook()
+-- Game thread (tile Construct hook). See applySavedNames.
+local function applyNameToConstructedTile(context)
+  local ok, err = pcall(function()
+    if not readyListName or editor.active() then return end
+    local tile = context:get()
+    if not tile or not tile:IsValid() then return end
+    local parent = tile:GetParent()
+    if not parent or not parent:IsValid() or parent:GetFullName() ~= readyListName then return end
+    local nm = getName(tile.Index)
+    if nm then writeLabel(tile, tileTextFor(nm)) end
+  end)
+  if not ok then
+    print("[LoadoutNamer] Could not name a newly constructed tile: " .. tostring(err) .. "\n")
+  end
+end
+
+-- Track which tile the mouse is over, and name tiles built after the panel pass.
+-- Registered lazily on first panel construction so Widget_Loadout_C is guaranteed
+-- loaded. Hazards respected: self:get() only (H3), read cached properties only, no
+-- native calls in the hover hook body (H8).
+local function registerTileHooks()
+  if not tileConstructHookRegistered then
+    local ok, err = pcall(RegisterHook, TILE_CONSTRUCT_FN, applyNameToConstructedTile)
+    if ok then
+      tileConstructHookRegistered = true
+    else
+      print("[LoadoutNamer] FAILED to register tile naming for added slots: " .. tostring(err) .. "\n")
+    end
+  end
   if hoverHookRegistered then
     return
   end
@@ -719,7 +713,7 @@ local function registerHoverHook()
       if getOk and tile and tile:IsValid() then
         hoveredTile = tile
         -- Reflected property read only in the hook body (H8); the tooltip work
-        -- itself runs later on the async poll + game thread.
+        -- itself runs on later HUD ticks.
         local idxOk, idx = pcall(function() return tile.Index end)
         if idxOk and type(idx) == "number" then
           scheduleTooltipTitle(idx)
@@ -735,8 +729,29 @@ local function registerHoverHook()
   end
 end
 
-local function beginRename(tile, recordIndex)
-  editor.open({tile = tile, index = recordIndex, characterID = characterKey()}, function(session)
+-- Keybind thread: only reserves the session. The hovered tile is checked on the
+-- game thread, when the editor is created.
+local function beginRename()
+  editor.open({characterID = characterKey()}, function(session)
+    local tile = hoveredTile
+    if not tile then
+      return false
+    end
+    if not tile:IsValid() then
+      hoveredTile = nil
+      return false
+    end
+    local idxOk, recordIndex = pcall(function() return tile.Index end)
+    if not idxOk or type(recordIndex) ~= "number" then
+      print(string.format("[LoadoutNamer] %s: could not read the hovered tile's record index - ignoring.\n", renameKeyName))
+      return false
+    end
+    if recordIndex == RESERVED_RECORD_INDEX then
+      print(string.format("[LoadoutNamer] %s: that's the game's Last Gear State auto-save slot - it can't be renamed.\n", renameKeyName))
+      return false
+    end
+    session.tile, session.index = tile, recordIndex
+
     -- Parent the editor into the title row, in place of the label.
     local row = tile.Label:GetParent()
     if not row or not row:IsValid() then
@@ -826,7 +841,7 @@ end
 
 editor = require("rename_session").new(closeRename, function(message)
   print("[LoadoutNamer] " .. message .. "\n")
-end)
+end, tick)
 
 local function endRename(commit)
   editor.finish(commit)
@@ -838,32 +853,24 @@ end
 
 -- ============================== keybinds ==============================
 
+-- UE4SS runs keybinds on its own input thread, so they only change Lua state.
+local tickMissingLogged = false
 RegisterKeyBind(renameKey, function()
   if editSessionActive() then
     endRename(true)
     return
   end
-
   if not hoveredTile then
     return
   end
-  local aliveOk, alive = pcall(function() return hoveredTile:IsValid() end)
-  if not aliveOk or not alive then
-    hoveredTile = nil
+  if not tick.installed() then
+    if not tickMissingLogged then
+      tickMissingLogged = true
+      print(string.format("[LoadoutNamer] %s ignored: the HUD tick that runs renames is not available yet.\n", renameKeyName))
+    end
     return
   end
-
-  local idxOk, idx = pcall(function() return hoveredTile.Index end)
-  if not idxOk or type(idx) ~= "number" then
-    print(string.format("[LoadoutNamer] %s: could not read the hovered tile's record index - ignoring.\n", renameKeyName))
-    return
-  end
-  if idx == RESERVED_RECORD_INDEX then
-    print(string.format("[LoadoutNamer] %s: that's the game's Last Gear State auto-save slot - it can't be renamed.\n", renameKeyName))
-    return
-  end
-
-  beginRename(hoveredTile, idx)
+  beginRename()
 end)
 
 RegisterKeyBind(Key.RETURN, function()
@@ -885,8 +892,19 @@ RegisterKeyBind(Key.RIGHT_MOUSE_BUTTON, function() editor.pointerPressed() end)
 
 -- ============================== wiring ==============================
 
+-- Hot reload in a world can register the HUD tick immediately. Otherwise the panel's
+-- Construct registers it, ahead of readiness; a later Refresh retry could be reached
+-- from another mod's HUD-tick callback (see game_tick.lua).
+tick.install()
+local tickMissingReported = false
+runtime.beforeReadiness("Construct", function()
+  registerTileHooks()
+  if not tick.install() and not tickMissingReported then
+    tickMissingReported = true
+    runtime.log("HUD tick unavailable; tooltip titles and renaming wait for it.")
+  end
+end)
 runtime.watchPanels(function(panel)
-  registerHoverHook()
   applySavedNames(panel)
 end)
 runtime.start()

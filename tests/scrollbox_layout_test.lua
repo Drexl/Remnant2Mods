@@ -1,7 +1,7 @@
 -- Run from the repository root: lua tests/scrollbox_layout_test.lua
 -- Mock construction/layout only; does not prove native ABI or rendered geometry.
 local realPrint = print
-local loops, queue, logs, onPanel = {}, {}, {}
+local logs, onPanel = {}
 local created, scrolls, frames, failFrame = 0, {}, {}, false
 print = function(message) logs[#logs+1] = message end
 local function obj(name)
@@ -49,14 +49,16 @@ StaticConstructObject = function(class)
   else frames[#frames+1]=widget; widget.dead=failFrame end
   return widget
 end
-LoopAsync = function(_, fn) loops[#loops+1]=fn end
-ExecuteInGameThread = function(fn) queue[#queue+1]=fn end
+LoopAsync = function() error("LoopAsync is forbidden") end
+ExecuteInGameThread = function() error("ExecuteInGameThread is forbidden") end
 RegisterHook = function() end
-NotifyOnNewObject = function(_, fn) onPanel=fn end
--- Also allow this focused test to run against the compatibility branch.
+-- The panel runtime calls onPanel from the panel's Construct hook.
 package.loaded.loadout_runtime = {new=function() return {
   watchPanels=function(fn) onPanel=fn end, start=function() end,
+  beforeReadiness=function() return {remove=function() end} end,
 } end}
+-- Engine-default ScrollBox path; tests/vanilla_scrollbox_test.lua covers the template.
+package.loaded.vanilla_scrollbox = {create=function() error("template unavailable in this fixture") end}
 FName, FText = function(s) return s end, function(s) return s end
 local function panel(name)
   local p, list, size = obj(name), obj(name .. ".list"), obj(name .. ".size")
@@ -82,16 +84,7 @@ local function panel(name)
   for i=0,7 do local t=tile("Vanilla" .. i); t.Index=i; addChild(list,t) end
   return p
 end
-local function drain()
-  for _=1,20 do
-    if #loops == 0 and #queue == 0 then return end
-    local pending=loops; loops={}
-    for _, fn in ipairs(pending) do if not fn() then loops[#loops+1]=fn end end
-    pending=queue; queue={}
-    for _, fn in ipairs(pending) do fn() end
-  end
-  error("scheduler did not quiesce")
-end
+local function drain() end -- panel work completes inside the Construct hook
 local function check(p)
   local list = p.LoadoutList
   local scroll, frame = list.parent, list.parent.parent

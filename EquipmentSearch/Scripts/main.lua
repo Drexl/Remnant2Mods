@@ -342,7 +342,8 @@ local function applyFilter(entry, verbose)
 end
 
 -- Sync every tracked list against its own text box. Runs on the game thread
--- only (never from inside a hook body directly - H8). Prunes dead entries.
+-- only: in a Blueprint hook that never touches its raw self (H8), or on a HUD
+-- tick. Prunes dead entries.
 local function refreshAllLists(forceApply)
     for key, entry in pairs(trackedLists) do
         local ok, err = pcall(function()
@@ -519,174 +520,209 @@ local function restoreTabHotkeys()
     hiddenTabs = {}
 end
 
+-- ---------- lifecycle and deferred work ----------
+-- Every list, card and menu access runs in a game-thread Blueprint hook or on a
+-- HUD tick (game_tick.lua). UE4SS 3.0.1 LoopAsync runs on a worker thread, and
+-- ExecuteInGameThread drains inside any ProcessEvent caller after lazily
+-- registering a process-wide callback, so this mod uses neither.
+-- Construct runs after the list's Slate widgets exist, so the bar's visibility
+-- write follows vanilla's construction-time CanSeeSearchBar binding.
+local LIST_CLASS_NAME = "Widget_InventoryList_C"
+local LIST_CONSTRUCT_FUNC_PATH = LIST_CLASS_PATH .. ":Construct"
+local TEMPLATE_FLAGS = 0x30 -- RF_ClassDefaultObject | RF_ArchetypeObject
+local MAX_READINESS_ATTEMPTS = 40
+local tick = require("game_tick").new(function(message)
+    print("[EquipmentSearch] " .. message .. "\n")
+end)
+local listStates = {}
+local registeredHooks = {}
+local hooksRegistered = false
+local watchdogStarted = false
+
+-- The game has rebuild paths that bypass Update/Build (the equip -> popup-reopen
+-- flow reset the grid to unfiltered). Instead of chasing every entry point,
+-- silently re-apply active filters on a short interval; a full pass measured
+-- ~2ms, so this is cheap.
+-- Registers the HUD tick, so call it only at mod start or from Construct (see
+-- game_tick.lua). Other hooks only check tick.installed().
+local function ensureTick()
+    if not tick.install() then return false end
+    if not watchdogStarted then
+        watchdogStarted = true
+        tick.loop(300, function()
+            for _, entry in pairs(trackedLists) do
+                if entry.query ~= "" then
+                    refreshAllLists(true)
+                    break
+                end
+            end
+            return false -- keep running for the mod's lifetime
+        end)
+    end
+    return true
+end
+
+-- Re-apply after the game's own grid passes (tab switch, equip, pickup, popup
+-- reopen). Build repopulates cards asynchronously, so re-apply again after a
+-- short delay - an immediate pass alone left reopened popups unfiltered.
+local function reapplyAfterVanillaPass()
+    refreshAllLists(true)
+    if tick.installed() then
+        tick.later(150, function() refreshAllLists(true) end)
+    end
+end
+
+local function reapplySearchBar(list)
+    local ok, err = pcall(function()
+        if list:IsValid() then showSearchBar(list) end
+    end)
+    if not ok then
+        print("[EquipmentSearch] Search bar reapply error: " .. tostring(err) .. "\n")
+    end
+end
+
+-- Keep pending and completed instances deduplicated. A new instance can reuse
+-- a destroyed widget's address; its unique full name tells them apart.
+local function stateFor(list)
+    for id, state in pairs(listStates) do
+        if not state.list:IsValid() then listStates[id] = nil end
+    end
+    local id, name = list:GetAddress(), list:GetFullName()
+    local state = listStates[id]
+    if state and state.name ~= name then state = nil end
+    if not state then
+        state = {list = list, name = name, attempts = 0, done = false}
+        listStates[id] = state
+    end
+    return state
+end
+
+-- Returns true once the list is settled (enabled or rejected).
+local function enableSearchBar(list, state)
+    local filter = list.Widget_InventorySearchFilter
+    if not filter or not filter:IsValid() then return false end
+    local box = filter.SearchFilterText
+    if not box or not box:IsValid() then return false end
+    local player = list:GetOwningPlayer()
+    if not player or not player:IsValid() then return false end
+
+    local shown, boxOrWhy = showSearchBar(list)
+    if not shown then
+        print("[EquipmentSearch] Search bar NOT enabled: " .. tostring(boxOrWhy) .. "\n")
+        return true
+    end
+    trackedLists[state.name] = {list = list, box = boxOrWhy, query = ""}
+    state.enabled = true
+    print("[EquipmentSearch] Search bar enabled on " .. state.name .. "\n")
+    -- CanSeeSearchBar may stomp an early visibility write; preserve the
+    -- existing one-shot construction-time reapply.
+    if tick.installed() then
+        tick.later(500, function() reapplySearchBar(list) end)
+    end
+    return true
+end
+
+-- Game thread: the list's Construct, Update and Build hooks.
+local function onListEvent(context, constructed)
+    local state
+    local ok, err = pcall(function()
+        local list = context:get()
+        if not list or not list:IsValid() or list:HasAnyFlags(TEMPLATE_FLAGS) then return end
+        state = stateFor(list)
+        if constructed then
+            ensureTick()
+            state.constructed = true
+            -- A rebuilt Slate widget re-applies vanilla's visibility binding.
+            if state.enabled then reapplySearchBar(list) end
+        end
+        if state.done or not state.constructed then return end
+        state.attempts = state.attempts + 1
+        if enableSearchBar(list, state) then
+            state.done = true
+        elseif state.attempts >= MAX_READINESS_ATTEMPTS then
+            state.done = true
+            print("[EquipmentSearch] List readiness timed out; bar not enabled: " .. state.name .. "\n")
+        end
+    end)
+    if not ok then
+        if state then state.done = true end
+        print("[EquipmentSearch] List setup failed: " .. tostring(err) .. "\n")
+    end
+end
+
 -- Hooks on /Game/ classes can only be registered once the Blueprint is loaded
 -- (fails with 'no UFunction found' at mod start on a fresh launch - research
--- doc 3.6b), so registration is deferred to the first successful capture.
-local hooksRegistered = false
-local function registerHooksOnce()
-    if hooksRegistered then return end
+-- doc 3.6b). Each hook registers at most once, even across partial failures.
+local function registerOnce(path, callback)
+    if registeredHooks[path] then return end
+    RegisterHook(path, callback)
+    registeredHooks[path] = true
+end
+
+local function registerHooks()
+    if hooksRegistered then return true end
+    local listClass = StaticFindObject(LIST_CLASS_PATH)
+    if not listClass or not listClass:IsValid() then return false end
 
     local ok, err = pcall(function()
-        -- fires per keystroke (proven). Hook bodies defer to the game thread;
-        -- no native calls in hook context. Which box changed doesn't matter -
+        -- Readiness and re-application run in the list's own game-thread hooks.
+        registerOnce(LIST_CONSTRUCT_FUNC_PATH, function(context) onListEvent(context, true) end)
+        local function onVanillaPass(context)
+            onListEvent(context, false)
+            reapplyAfterVanillaPass()
+        end
+        registerOnce(LIST_UPDATE_FUNC_PATH, onVanillaPass)
+        registerOnce(LIST_BUILD_FUNC_PATH, onVanillaPass)
+
+        -- Fires per keystroke (proven). Which box changed doesn't matter -
         -- the sync pass reads every tracked list's own box.
-        RegisterHook(TEXTCHANGED_FUNC_PATH, function()
-            ExecuteInGameThread(function() refreshAllLists(false) end)
-        end)
-
+        registerOnce(TEXTCHANGED_FUNC_PATH, function() refreshAllLists(false) end)
         -- X button: box is now empty; the sync pass restores that list's grid
-        RegisterHook(XBUTTON_FUNC_PATH, function()
-            ExecuteInGameThread(function() refreshAllLists(false) end)
-        end)
+        registerOnce(XBUTTON_FUNC_PATH, function() refreshAllLists(false) end)
 
-        -- typing session boundary: focus enters the search box -> hide the
+        -- Typing session boundary: focus enters the search box -> hide the
         -- menu's tab buttons (blocks the M-to-map hotkey); focus leaves ->
         -- restore. Fires on click-in, so suppression is in place before the
         -- first keystroke. Own pcall: these are inherited-override functions
         -- (not bound events); if they fail to register the core search hooks
-        -- must survive, and the outer pcall must not retry-and-double-register
-        -- them on the next list construction.
+        -- must survive.
         local okFocus, focusErr = pcall(function()
-            RegisterHook(FOCUS_ADDED_FUNC_PATH, function()
-                ExecuteInGameThread(suppressTabHotkeys)
-            end)
-            RegisterHook(FOCUS_REMOVED_FUNC_PATH, function()
-                ExecuteInGameThread(restoreTabHotkeys)
-            end)
+            registerOnce(FOCUS_ADDED_FUNC_PATH, function() suppressTabHotkeys() end)
+            registerOnce(FOCUS_REMOVED_FUNC_PATH, function() restoreTabHotkeys() end)
         end)
         if not okFocus then
             print("[EquipmentSearch] focus-hook registration failed (M-to-map "
                 .. "hotkey NOT suppressed while typing): "
                 .. tostring(focusErr) .. "\n")
         end
-
-        -- re-apply after the game's own grid passes (tab switch, equip,
-        -- pickup, popup reopen). Build repopulates cards asynchronously, so
-        -- re-apply again after a short delay - an immediate pass alone left
-        -- reopened popups unfiltered.
-        local function reapplyAfterVanillaPass()
-            ExecuteInGameThread(function() refreshAllLists(true) end)
-            LoopAsync(150, function()
-                ExecuteInGameThread(function() refreshAllLists(true) end)
-                return true -- one-shot
-            end)
-        end
-        RegisterHook(LIST_UPDATE_FUNC_PATH, function() end, reapplyAfterVanillaPass)
-        RegisterHook(LIST_BUILD_FUNC_PATH,  function() end, reapplyAfterVanillaPass)
-
-        -- watchdog: the game has rebuild paths that bypass Update/Build (the
-        -- equip -> popup-reopen flow reset the grid to unfiltered). Instead of
-        -- chasing every entry point, silently re-apply active filters on a
-        -- short interval; a full pass measured ~2ms, so this is cheap.
-        LoopAsync(300, function()
-            local anyActive = false
-            for _, entry in pairs(trackedLists) do
-                if entry.query ~= "" then anyActive = true break end
-            end
-            if anyActive then
-                ExecuteInGameThread(function() refreshAllLists(true) end)
-            end
-            return false -- keep running for the mod's lifetime
-        end)
     end)
 
     if ok then
         hooksRegistered = true
-        print("[EquipmentSearch] hooks registered (TextChanged, X button, "
+        print("[EquipmentSearch] hooks registered (Construct, TextChanged, X button, "
             .. "focus in/out, Update/Build passes).\n")
     else
         print("[EquipmentSearch] hook registration FAILED: " .. tostring(err) .. "\n")
     end
+    return hooksRegistered
 end
 
--- Stable v3.0.1 resolves NotifyOnNewObject's class at registration time;
--- LIST_CLASS_PATH may not be loaded yet on a cold launch. Watch the resident
--- native ancestor instead, as in the loadout mods, and discard unrelated
--- widgets immediately. No global discovery scan or hot-reload is required.
-local LIST_CLASS_NAME = "Widget_InventoryList_C"
-local TEMPLATE_FLAGS = 0x30 -- RF_ClassDefaultObject | RF_ArchetypeObject
-local listStates = {}
-local baseWidget = StaticFindObject("/Script/UMG.UserWidget")
-assert(baseWidget and baseWidget:IsValid(), "native UserWidget class is unavailable")
-
-NotifyOnNewObject("/Script/UMG.UserWidget", function(list)
-    if not list or not list:IsValid() then return end
-    if list:GetClass():GetFName():ToString() ~= LIST_CLASS_NAME then return end
-    if list:HasAnyFlags(TEMPLATE_FLAGS) then return end
-    if list:GetFullName():find("Default__", 1, true) then return end
-
-    -- Keep pending and completed instances deduplicated, but allow a new
-    -- instance to reuse an address after the previous widget is destroyed.
-    for id, state in pairs(listStates) do
-        if not state.list:IsValid() then listStates[id] = nil end
-    end
-    local id = list:GetAddress()
-    if listStates[id] then return end
-    local state = {list = list, attempts = 0, queued = false, done = false}
-    listStates[id] = state
-
-    LoopAsync(50, function()
-        if state.done then return true end
-        -- A stalled game thread must not accumulate readiness callbacks.
-        if not state.queued then
-            state.queued = true
-            ExecuteInGameThread(function()
-                state.queued = false
-                if state.done then return end
-                state.attempts = state.attempts + 1
-                if not list:IsValid() then
-                    state.done = true
-                    listStates[id] = nil
-                    return
-                end
-                -- All child/owner reads and widget work stay on the game thread.
-                local ok, err = pcall(function()
-                    local filter = list.Widget_InventorySearchFilter
-                    if not filter or not filter:IsValid() then return end
-                    local box = filter.SearchFilterText
-                    if not box or not box:IsValid() then return end
-                    local player = list:GetOwningPlayer()
-                    if not player or not player:IsValid() then return end
-
-                    local shown, boxOrWhy = showSearchBar(list)
-                    state.done = true
-                    if not shown then
-                        print("[EquipmentSearch] Search bar NOT enabled: "
-                            .. tostring(boxOrWhy) .. "\n")
-                        return
-                    end
-                    trackedLists[list:GetFullName()] = {
-                        list = list, box = boxOrWhy, query = "",
-                    }
-                    registerHooksOnce()
-                    print("[EquipmentSearch] Search bar enabled on "
-                        .. list:GetFullName() .. "\n")
-                    -- CanSeeSearchBar may stomp an early visibility write;
-                    -- preserve the existing one-shot construction-time reapply.
-                    LoopAsync(500, function()
-                        ExecuteInGameThread(function()
-                            local okReapply, reapplyErr = pcall(function()
-                                if list:IsValid() then showSearchBar(list) end
-                            end)
-                            if not okReapply then
-                                print("[EquipmentSearch] Search bar reapply error: "
-                                    .. tostring(reapplyErr) .. "\n")
-                            end
-                        end)
-                        return true
-                    end)
-                end)
-                if not ok then
-                    state.done = true
-                    print("[EquipmentSearch] List setup failed: " .. tostring(err) .. "\n")
-                elseif not state.done and state.attempts >= 40 then
-                    state.done = true
-                    print("[EquipmentSearch] List readiness timed out; bar not enabled: "
-                        .. list:GetFullName() .. "\n")
-                end
-            end)
-        end
-        return state.done
+-- Hot reload in a world finds both classes loaded and needs no listener.
+ensureTick()
+if not registerHooks() then
+    -- Stable v3.0.1 resolves NotifyOnNewObject's class at registration time;
+    -- LIST_CLASS_PATH may not be loaded yet on a cold launch. Watch the
+    -- resident native ancestor only until the list class exists, then stop.
+    -- No global discovery scan or hot-reload is required.
+    local baseWidget = StaticFindObject("/Script/UMG.UserWidget")
+    assert(baseWidget and baseWidget:IsValid(), "native UserWidget class is unavailable")
+    NotifyOnNewObject("/Script/UMG.UserWidget", function(list)
+        if hooksRegistered then return true end
+        if not list or not list:IsValid() then return false end
+        if list:GetClass():GetFName():ToString() ~= LIST_CLASS_NAME then return false end
+        if list:HasAnyFlags(TEMPLATE_FLAGS) then return false end
+        if list:GetFullName():find("Default__", 1, true) then return false end
+        return registerHooks()
     end)
-end)
-print("[EquipmentSearch] Native widget listener started (no global discovery scans).\n")
+    print("[EquipmentSearch] Native widget listener started (no global discovery scans).\n")
+end

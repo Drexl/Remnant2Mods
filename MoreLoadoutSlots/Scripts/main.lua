@@ -1,6 +1,6 @@
 print("[MoreLoadoutSlots] Loaded and running.\n")
-local runtime = require("loadout_runtime").new("MoreLoadoutSlots")
 local vanillaScrollBox = require("vanilla_scrollbox")
+local runtime = require("loadout_runtime").new("MoreLoadoutSlots")
 
 -- The one knob: total loadout slots (vanilla has 8). Drives both the LoadoutComponent
 -- record-capacity patch and how many extra tiles get added to the Loadouts screen; the
@@ -12,10 +12,12 @@ local TOTAL_LOADOUT_SLOTS = 20
 -- this field - not currently load-bearing for the single extra tile below (the underlying
 -- record storage already supports index 8 with the native default of NumRecords=11), but kept
 -- here since going beyond 11 total slots eventually will need it.
+-- The client RPC runs on the game thread, so the patch runs inside this hook rather
+-- than in UE4SS's ProcessEvent-drained ExecuteInGameThread queue.
 RegisterHook("/Script/Engine.PlayerController:ClientRestart", function(self, NewPawn)
   print(string.format("[MoreLoadoutSlots] Player spawned - patching LoadoutComponent.Slots[].NumRecords to %d (%d player slots + the reserved last-gear-state record).\n", TOTAL_LOADOUT_SLOTS + 1, TOTAL_LOADOUT_SLOTS))
 
-  ExecuteInGameThread(function()
+  do
     local components = FindAllOf("LoadoutComponent")
     if not components then
       print("[MoreLoadoutSlots] WARNING: FindAllOf(\"LoadoutComponent\") returned nothing - NumRecords not patched, extra loadout slots will error when used.\n")
@@ -49,7 +51,7 @@ RegisterHook("/Script/Engine.PlayerController:ClientRestart", function(self, New
       print(string.format("[MoreLoadoutSlots] WARNING: only patched %d/%d slot(s) across %d/%d LoadoutComponent(s) - some loadout records may still cap at the vanilla limit.\n",
         slotsPatched, slotsAttempted, componentsPatched, #components))
     end
-  end)
+  end
 end)
 
 -- Mod #1 extra-tile logic.
@@ -154,17 +156,17 @@ local function registerTileInteractionHooks()
       "[MoreLoadoutSlots] %s on this mod's extra tile (Index=%d) - forwarding to the panel's %s handler (the game's own tiles get this via a delegate subscription UE4SS can't replicate).\n",
       actionLabel, idx, panelHandlerName
     ))
-    ExecuteInGameThread(function()
-      local callOk, callErr = pcall(function()
-        currentPanel[panelHandlerName](currentPanel, idx)
-      end)
-      if not callOk then
-        print(string.format(
-          "[MoreLoadoutSlots] FAILED to call the panel's %s handler: %s\n",
-          panelHandlerName, tostring(callErr)
-        ))
-      end
+    -- A vanilla tile reaches the panel inside this same click event, through its
+    -- delegate broadcast, so forward from the hook itself.
+    local callOk, callErr = pcall(function()
+      currentPanel[panelHandlerName](currentPanel, idx)
     end)
+    if not callOk then
+      print(string.format(
+        "[MoreLoadoutSlots] FAILED to call the panel's %s handler: %s\n",
+        panelHandlerName, tostring(callErr)
+      ))
+    end
   end
 
   -- Right-click = save. The tile's internal button's OnMouseRightClick is bound (via the
@@ -324,6 +326,10 @@ end
 -- touches the property on a tile of ours. Success is detected by reaching the
 -- line after the risky read, never by pcall's return value (which the failure
 -- is known to bypass).
+-- Isolation: the probe has its own hook on the panel's Refresh, which Construct
+-- calls before the readiness hook runs. An abort ends only that Refresh dispatch,
+-- but it bypasses Lua's own unwinding and can leave the hook's Lua thread mid-call,
+-- so the same Construct unregisters the probe before its thread can run again.
 local multicastDelegatesProbed = false
 local multicastDelegatesSupported = false
 
@@ -346,208 +352,205 @@ end
 
 local function addExtraLoadoutTile(panel)
   local TARGET_TILE_COUNT = TOTAL_LOADOUT_SLOTS
-  local attempts = 0
-  local MAX_ATTEMPTS = 40 -- ~2 seconds at 50ms per attempt, safety cap
+  -- Called from the panel's Construct hook after Refresh(true) built the vanilla
+  -- tiles, so LoadoutList is ready and this already runs on the game thread.
+  local list = panel.LoadoutList
+  if not multicastDelegatesProbed then
+    print("[MoreLoadoutSlots] Multicast delegate support was not probed before this panel was ready - using the hook-forwarding fallback.\n")
+  end
+  if not injectScrollBox(panel, list) then
+    return -- without the ScrollBox, extra tiles would render below the visible panel
+  end
 
-  LoopAsync(50, function()
-    attempts = attempts + 1
+  -- Idempotency guard: the runtime readies each panel instance once, but skip anyway
+  -- if the target count is already met.
+  local countOk, currentCount = pcall(function() return list:GetChildrenCount() end)
+  if countOk and currentCount and currentCount >= TARGET_TILE_COUNT then
+    print(string.format("[MoreLoadoutSlots] Loadouts screen already has %d tiles (target %d) - not adding another.\n", currentCount, TARGET_TILE_COUNT))
+    return
+  end
 
-    local listOk, list = pcall(function() return panel.LoadoutList end)
-    if not listOk or not list or not list:IsValid() then
-      if attempts >= MAX_ATTEMPTS then
-        print("[MoreLoadoutSlots] Timed out after " .. attempts .. " polling attempts waiting for the Loadouts screen's tile container (LoadoutList) to finish initializing - giving up for this screen-open, no extra tile added.\n")
-        return true -- stop looping
-      end
-      return false -- keep polling
-    end
+  local tileClassOk, tileClass = pcall(function()
+    return StaticFindObject("/Game/UI2/UI_Widgets/UI_Game/UI_Game_Character/Widget_Loadout.Widget_Loadout_C")
+  end)
+  if not tileClassOk or not tileClass or not tileClass:IsValid() then
+    print("[MoreLoadoutSlots] FAILED to find the Widget_Loadout_C tile class - cannot add an extra loadout slot this session. Error: " .. tostring(tileClass) .. "\n")
+    return
+  end
 
-    -- On stable, the unsupported delegate read can abort its native callback
-    -- despite Lua pcall. Probe in a separate callback so the first injection
-    -- still runs, using the existing forwarding fallback when unsupported.
-    ExecuteInGameThread(function() probeMulticastDelegateSupport(list) end)
+  -- Construct the tile the same way the game's own panel Refresh does: via
+  -- WidgetBlueprintLibrary.Create, the native function behind the Blueprint "Create Widget"
+  -- node. The earlier StaticConstructObject approach produced a tile that rendered and
+  -- showed tooltips but ignored all clicks - the tile class's FModel JSON dump revealed a
+  -- ComponentDelegateBinding wiring Button.OnMouseRightClick (save), Button.OnClicked
+  -- (load), and mouse enter/leave to the tile's handlers, and those dynamic delegate
+  -- bindings are only applied during UUserWidget::Initialize(), which CreateWidget runs
+  -- and raw StaticConstructObject skips (Initialize isn't a reflected UFunction, so it
+  -- can't be called from Lua after the fact).
+  local wblOk, wbl = pcall(function()
+    return StaticFindObject("/Script/UMG.Default__WidgetBlueprintLibrary")
+  end)
+  if not wblOk or not wbl or not wbl:IsValid() then
+    print("[MoreLoadoutSlots] FAILED to find the engine's WidgetBlueprintLibrary (needed to create widgets through the normal UMG lifecycle) - cannot add an extra loadout slot this session. Error: " .. tostring(wbl) .. "\n")
+    return
+  end
 
-    ExecuteInGameThread(function()
-      if not injectScrollBox(panel, list) then
-        return -- without the ScrollBox, extra tiles would render below the visible panel
-      end
+  local templateOk, template = pcall(function()
+    return StaticFindObject("/Game/_Core/Loadouts/Gear_Loadout.Gear_Loadout")
+  end)
+  if not templateOk or not template or not template:IsValid() then
+    print("[MoreLoadoutSlots] FAILED to find the Gear_Loadout template asset - cannot configure new tiles. Error: " .. tostring(template) .. "\n")
+    return
+  end
 
-      -- Idempotency guard: this whole function can run again on a screen reopen (a fresh
-      -- NotifyOnNewObject firing for a newly-constructed panel instance). Skip if the target
-      -- count is already met.
-      local countOk, currentCount = pcall(function() return list:GetChildrenCount() end)
-      if countOk and currentCount and currentCount >= TARGET_TILE_COUNT then
-        print(string.format("[MoreLoadoutSlots] Loadouts screen already has %d tiles (target %d) - not adding another.\n", currentCount, TARGET_TILE_COUNT))
-        return
-      end
+  -- The owning player for CreateWidget must be the LOCAL player controller. In solo play
+  -- FindFirstOf("PlayerController") happened to be it, but in multiplayer other controller
+  -- objects exist on this machine and FindFirstOf can return a remote one - CreateWidget
+  -- then returns an invalid widget (observed 2026-07-12 in a co-op session: every tile
+  -- failed IsValid). The panel widget already knows its owning player, so ask it.
+  local playerController = nil
+  local ownerOk, owner = pcall(function() return panel:GetOwningPlayer() end)
+  if ownerOk and owner and owner:IsValid() then
+    playerController = owner
+  else
+    playerController = FindFirstOf("PlayerController")
+    print(string.format("[MoreLoadoutSlots] panel:GetOwningPlayer() unavailable (%s) - falling back to FindFirstOf(\"PlayerController\"); tile creation may fail in multiplayer.\n",
+      tostring(owner)))
+  end
 
-      local tileClassOk, tileClass = pcall(function()
-        return StaticFindObject("/Game/UI2/UI_Widgets/UI_Game/UI_Game_Character/Widget_Loadout.Widget_Loadout_C")
+  -- A tile's clicks broadcast multicast delegates (OnClicked/OnLoadoutSaved/
+  -- OnLoadoutSlotDeleted) that the PANEL subscribes to for tiles it creates itself - the
+  -- save/load confirmation dialogs live in the panel's handlers, not the tile. Each new
+  -- tile below tries to replicate those exact subscriptions natively via the delegate
+  -- :Add() API (added in experimental UE4SS; under 3.0.1 merely READING the property
+  -- aborted the whole callback despite pcall - see research doc 3.4o). Tiles where the
+  -- native binding fails fall back to the hook-forwarding path (registerTileInteraction-
+  -- Hooks + the ourTileFullNames registry).
+
+  -- Create one tile per missing slot. Vanilla tiles occupy records 0..7; ours continue
+  -- from there - EXCEPT record 10, the game's reserved "last gear state" auto-save
+  -- (discovered in testing: a tile at Index=10 self-overwrites on every equip, exactly
+  -- like the auto-save slot; native NumRecords=11 = 8 visible + reserved storage). So
+  -- our tiles use records 8, 9, 11, 12, ... and each tile whose record index no longer
+  -- matches its visible position gets a LabelOverride so the on-screen names stay a
+  -- clean "Loadout 9".."Loadout 20" with no gap.
+  local RESERVED_RECORD_INDEX = 10
+  local addedCount = 0
+  local boundCount = 0    -- tiles on the native delegate-subscription path
+  local fallbackCount = 0 -- tiles on the hook-forwarding fallback path
+  local recordIndex = currentCount
+  local visibleCount = currentCount
+  while visibleCount < TARGET_TILE_COUNT do
+    if recordIndex == RESERVED_RECORD_INDEX then
+      recordIndex = recordIndex + 1
+    else
+      local constructOk, newTile = pcall(function()
+        return wbl:Create(panel, tileClass, playerController)
       end)
-      if not tileClassOk or not tileClass or not tileClass:IsValid() then
-        print("[MoreLoadoutSlots] FAILED to find the Widget_Loadout_C tile class - cannot add an extra loadout slot this session. Error: " .. tostring(tileClass) .. "\n")
-        return
+      if not constructOk or not newTile or not newTile:IsValid() then
+        print(string.format("[MoreLoadoutSlots] FAILED to create the tile for record index %d via WidgetBlueprintLibrary.Create - stopping here (%d of the extra tiles were added). Error: %s\n",
+          recordIndex, addedCount, tostring(newTile)))
+        break
       end
 
-      -- Construct the tile the same way the game's own panel Refresh does: via
-      -- WidgetBlueprintLibrary.Create, the native function behind the Blueprint "Create Widget"
-      -- node. The earlier StaticConstructObject approach produced a tile that rendered and
-      -- showed tooltips but ignored all clicks - the tile class's FModel JSON dump revealed a
-      -- ComponentDelegateBinding wiring Button.OnMouseRightClick (save), Button.OnClicked
-      -- (load), and mouse enter/leave to the tile's handlers, and those dynamic delegate
-      -- bindings are only applied during UUserWidget::Initialize(), which CreateWidget runs
-      -- and raw StaticConstructObject skips (Initialize isn't a reflected UFunction, so it
-      -- can't be called from Lua after the fact).
-      local wblOk, wbl = pcall(function()
-        return StaticFindObject("/Script/UMG.Default__WidgetBlueprintLibrary")
-      end)
-      if not wblOk or not wbl or not wbl:IsValid() then
-        print("[MoreLoadoutSlots] FAILED to find the engine's WidgetBlueprintLibrary (needed to create widgets through the normal UMG lifecycle) - cannot add an extra loadout slot this session. Error: " .. tostring(wbl) .. "\n")
-        return
-      end
+      pcall(function() newTile.Index = recordIndex end)
+      pcall(function() newTile.LoadoutTemplate = template end)
 
-      local templateOk, template = pcall(function()
-        return StaticFindObject("/Game/_Core/Loadouts/Gear_Loadout.Gear_Loadout")
-      end)
-      if not templateOk or not template or not template:IsValid() then
-        print("[MoreLoadoutSlots] FAILED to find the Gear_Loadout template asset - cannot configure new tiles. Error: " .. tostring(template) .. "\n")
-        return
-      end
-
-      -- The owning player for CreateWidget must be the LOCAL player controller. In solo play
-      -- FindFirstOf("PlayerController") happened to be it, but in multiplayer other controller
-      -- objects exist on this machine and FindFirstOf can return a remote one - CreateWidget
-      -- then returns an invalid widget (observed 2026-07-12 in a co-op session: every tile
-      -- failed IsValid). The panel widget already knows its owning player, so ask it.
-      local playerController = nil
-      local ownerOk, owner = pcall(function() return panel:GetOwningPlayer() end)
-      if ownerOk and owner and owner:IsValid() then
-        playerController = owner
-      else
-        playerController = FindFirstOf("PlayerController")
-        print(string.format("[MoreLoadoutSlots] panel:GetOwningPlayer() unavailable (%s) - falling back to FindFirstOf(\"PlayerController\"); tile creation may fail in multiplayer.\n",
-          tostring(owner)))
-      end
-
-      -- A tile's clicks broadcast multicast delegates (OnClicked/OnLoadoutSaved/
-      -- OnLoadoutSlotDeleted) that the PANEL subscribes to for tiles it creates itself - the
-      -- save/load confirmation dialogs live in the panel's handlers, not the tile. Each new
-      -- tile below tries to replicate those exact subscriptions natively via the delegate
-      -- :Add() API (added in experimental UE4SS; under 3.0.1 merely READING the property
-      -- aborted the whole callback despite pcall - see research doc 3.4o). Tiles where the
-      -- native binding fails fall back to the hook-forwarding path (registerTileInteraction-
-      -- Hooks + the ourTileFullNames registry).
-
-      -- Create one tile per missing slot. Vanilla tiles occupy records 0..7; ours continue
-      -- from there - EXCEPT record 10, the game's reserved "last gear state" auto-save
-      -- (discovered in testing: a tile at Index=10 self-overwrites on every equip, exactly
-      -- like the auto-save slot; native NumRecords=11 = 8 visible + reserved storage). So
-      -- our tiles use records 8, 9, 11, 12, ... and each tile whose record index no longer
-      -- matches its visible position gets a LabelOverride so the on-screen names stay a
-      -- clean "Loadout 9".."Loadout 20" with no gap.
-      local RESERVED_RECORD_INDEX = 10
-      local addedCount = 0
-      local boundCount = 0    -- tiles on the native delegate-subscription path
-      local fallbackCount = 0 -- tiles on the hook-forwarding fallback path
-      local recordIndex = currentCount
-      local visibleCount = currentCount
-      while visibleCount < TARGET_TILE_COUNT do
-        if recordIndex == RESERVED_RECORD_INDEX then
-          recordIndex = recordIndex + 1
-        else
-          local constructOk, newTile = pcall(function()
-            return wbl:Create(panel, tileClass, playerController)
-          end)
-          if not constructOk or not newTile or not newTile:IsValid() then
-            print(string.format("[MoreLoadoutSlots] FAILED to create the tile for record index %d via WidgetBlueprintLibrary.Create - stopping here (%d of the extra tiles were added). Error: %s\n",
-              recordIndex, addedCount, tostring(newTile)))
-            break
-          end
-
-          pcall(function() newTile.Index = recordIndex end)
-          pcall(function() newTile.LoadoutTemplate = template end)
-
-          -- Default tile label is "Loadout {Index+1}"; past the reserved record the index
-          -- runs ahead of the visible position, so pin the label to the visible position.
-          -- FText() wrapping is mandatory - a raw Lua string into an FText slot is the
-          -- known hard-crash class (research doc 3.4b), though that was a function call
-          -- and this is a property write.
-          if recordIndex ~= visibleCount then
-            local labelOk, labelErr = pcall(function()
-              newTile.LabelOverride = FText(string.format("Loadout %d", visibleCount + 1))
-            end)
-            if not labelOk then
-              print(string.format("[MoreLoadoutSlots] Could not set the label override for the tile at record index %d (it will display its record-derived name instead): %s\n",
-                recordIndex, tostring(labelErr)))
-            end
-          end
-
-          -- Subscribe the panel's handlers to this tile's delegates - the exact bindings the
-          -- panel's own Refresh gives the tiles IT creates (delegate names and handler
-          -- pairings verified against both FModel dumps). On this path the tile behaves 100%
-          -- vanilla: its own handlers gate the equipped/empty cases BEFORE broadcasting, and
-          -- all four inputs (LMB/RMB/Space/F) route through these three delegates natively.
-          -- Never attempt this when the startup probe found no multicast delegate
-          -- support - on those builds even the property READ inside the pcall below
-          -- would pierce it and abort this whole tile-creation pass.
-          local bindOk, bindErr = false, nil
-          if multicastDelegatesSupported then
-            bindOk, bindErr = pcall(function()
-              newTile.OnClicked:Add(panel, FName("OnLoadoutClicked"))
-              newTile.OnLoadoutSaved:Add(panel, FName("OnLoadoutSlotSaved"))
-              newTile.OnLoadoutSlotDeleted:Add(panel, FName("OnLoadoutSlotDeleted"))
-            end)
-          end
-          if bindOk then
-            boundCount = boundCount + 1
-          else
-            if multicastDelegatesSupported then
-              -- Roll back any binding that DID land before the failure (a half-bound tile on
-              -- the fallback path would double-fire that event), then register the tile for
-              -- the hook-forwarding fallback.
-              pcall(function() newTile.OnClicked:Remove(panel, FName("OnLoadoutClicked")) end)
-              pcall(function() newTile.OnLoadoutSaved:Remove(panel, FName("OnLoadoutSlotSaved")) end)
-              pcall(function() newTile.OnLoadoutSlotDeleted:Remove(panel, FName("OnLoadoutSlotDeleted")) end)
-              print(string.format("[MoreLoadoutSlots] Native delegate binding failed for the tile at record index %d - using the hook-forwarding fallback for it. Error: %s\n",
-                recordIndex, tostring(bindErr)))
-            end
-            fallbackCount = fallbackCount + 1
-            pcall(function() ourTileFullNames[newTile:GetFullName()] = true end)
-          end
-
-          pcall(function() newTile:Refresh() end)
-
-          local addOk, addResult = pcall(function() return list:AddChild(newTile) end)
-          if not addOk then
-            print(string.format("[MoreLoadoutSlots] FAILED to add the tile for record index %d into the Loadouts screen's tile list - stopping here (%d of the extra tiles were added). Error: %s\n",
-              recordIndex, addedCount, tostring(addResult)))
-            break
-          end
-
-          addedCount = addedCount + 1
-          visibleCount = visibleCount + 1
-          recordIndex = recordIndex + 1
+      -- Default tile label is "Loadout {Index+1}"; past the reserved record the index
+      -- runs ahead of the visible position, so pin the label to the visible position.
+      -- FText() wrapping is mandatory - a raw Lua string into an FText slot is the
+      -- known hard-crash class (research doc 3.4b), though that was a function call
+      -- and this is a property write.
+      if recordIndex ~= visibleCount then
+        local labelOk, labelErr = pcall(function()
+          newTile.LabelOverride = FText(string.format("Loadout %d", visibleCount + 1))
+        end)
+        if not labelOk then
+          print(string.format("[MoreLoadoutSlots] Could not set the label override for the tile at record index %d (it will display its record-derived name instead): %s\n",
+            recordIndex, tostring(labelErr)))
         end
       end
 
-      -- The forwarding hooks are only needed for fallback-path tiles (registered lazily
-      -- here because the Widget_Loadout_C class is guaranteed loaded at this point, which
-      -- isn't true at mod startup).
-      if fallbackCount > 0 then
-        registerTileInteractionHooks()
+      -- Subscribe the panel's handlers to this tile's delegates - the exact bindings the
+      -- panel's own Refresh gives the tiles IT creates (delegate names and handler
+      -- pairings verified against both FModel dumps). On this path the tile behaves 100%
+      -- vanilla: its own handlers gate the equipped/empty cases BEFORE broadcasting, and
+      -- all four inputs (LMB/RMB/Space/F) route through these three delegates natively.
+      -- Never attempt this when the startup probe found no multicast delegate
+      -- support - on those builds even the property READ inside the pcall below
+      -- would pierce it and abort this whole tile-creation pass.
+      local bindOk, bindErr = false, nil
+      if multicastDelegatesSupported then
+        bindOk, bindErr = pcall(function()
+          newTile.OnClicked:Add(panel, FName("OnLoadoutClicked"))
+          newTile.OnLoadoutSaved:Add(panel, FName("OnLoadoutSlotSaved"))
+          newTile.OnLoadoutSlotDeleted:Add(panel, FName("OnLoadoutSlotDeleted"))
+        end)
+      end
+      if bindOk then
+        boundCount = boundCount + 1
+      else
+        if multicastDelegatesSupported then
+          -- Roll back any binding that DID land before the failure (a half-bound tile on
+          -- the fallback path would double-fire that event), then register the tile for
+          -- the hook-forwarding fallback.
+          pcall(function() newTile.OnClicked:Remove(panel, FName("OnLoadoutClicked")) end)
+          pcall(function() newTile.OnLoadoutSaved:Remove(panel, FName("OnLoadoutSlotSaved")) end)
+          pcall(function() newTile.OnLoadoutSlotDeleted:Remove(panel, FName("OnLoadoutSlotDeleted")) end)
+          print(string.format("[MoreLoadoutSlots] Native delegate binding failed for the tile at record index %d - using the hook-forwarding fallback for it. Error: %s\n",
+            recordIndex, tostring(bindErr)))
+        end
+        fallbackCount = fallbackCount + 1
+        pcall(function() ourTileFullNames[newTile:GetFullName()] = true end)
       end
 
-      -- The SizeBox stays at its native 688px HeightOverride (8 tiles' worth) on purpose -
-      -- the injected ScrollBox handles all overflow. (Historical: before the ScrollBox we
-      -- grew the SizeBox itself via list.Slot.Parent:SetHeightOverride - that path is dead,
-      -- and list.Slot.Parent now resolves to the ScrollBox, not the SizeBox.)
+      pcall(function() newTile:Refresh() end)
 
-      print(string.format("[MoreLoadoutSlots] Added %d extra loadout tiles (records %d-%d, skipping the reserved last-gear-state record %d) - the Loadouts screen now has %d slots. Interaction paths: %d native delegate subscriptions, %d hook-forwarding fallbacks.\n",
-        addedCount, currentCount, recordIndex - 1, RESERVED_RECORD_INDEX, visibleCount, boundCount, fallbackCount))
-    end)
+      local addOk, addResult = pcall(function() return list:AddChild(newTile) end)
+      if not addOk then
+        print(string.format("[MoreLoadoutSlots] FAILED to add the tile for record index %d into the Loadouts screen's tile list - stopping here (%d of the extra tiles were added). Error: %s\n",
+          recordIndex, addedCount, tostring(addResult)))
+        break
+      end
 
-    return true -- stop looping, we found a valid LoadoutList
-  end)
+      addedCount = addedCount + 1
+      visibleCount = visibleCount + 1
+      recordIndex = recordIndex + 1
+    end
+  end
+
+  -- The forwarding hooks are only needed for fallback-path tiles (registered lazily
+  -- here because the Widget_Loadout_C class is guaranteed loaded at this point, which
+  -- isn't true at mod startup).
+  if fallbackCount > 0 then
+    registerTileInteractionHooks()
+  end
+
+  -- The SizeBox stays at its native 688px HeightOverride (8 tiles' worth) on purpose -
+  -- the injected ScrollBox handles all overflow. (Historical: before the ScrollBox we
+  -- grew the SizeBox itself via list.Slot.Parent:SetHeightOverride - that path is dead,
+  -- and list.Slot.Parent now resolves to the ScrollBox, not the SizeBox.)
+
+  print(string.format("[MoreLoadoutSlots] Added %d extra loadout tiles (records %d-%d, skipping the reserved last-gear-state record %d) - the Loadouts screen now has %d slots. Interaction paths: %d native delegate subscriptions, %d hook-forwarding fallbacks.\n",
+    addedCount, currentCount, recordIndex - 1, RESERVED_RECORD_INDEX, visibleCount, boundCount, fallbackCount))
 end
+
+local probeHook = runtime.beforeReadiness("Refresh", function(context)
+  if multicastDelegatesProbed then return end
+  local panel = context:get()
+  if panel and panel:IsValid() then
+    probeMulticastDelegateSupport(panel.LoadoutList)
+  end
+end)
+runtime.beforeReadiness("Construct", function()
+  if not multicastDelegatesProbed or not probeHook then return end
+  local hook = probeHook
+  probeHook = nil
+  local removed, removeErr = pcall(hook.remove)
+  if not removed then
+    print("[MoreLoadoutSlots] WARNING: could not unregister the delegate-support probe: " .. tostring(removeErr) .. "\n")
+  end
+end)
 
 runtime.watchPanels(function(panel)
   currentPanel = panel

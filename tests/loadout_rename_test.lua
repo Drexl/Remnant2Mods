@@ -1,9 +1,10 @@
 -- Run: lua tests/loadout_rename_test.lua [path/to/LoadoutNamer/Scripts/main.lua]
--- UI/session integration with in-memory names/settings and a mock game thread.
+-- UI/session integration with in-memory names/settings. Keybinds run off the game
+-- thread; only HUD ticks may touch widgets.
 local source = arg[1] or "LoadoutNamer/Scripts/main.lua"
 package.path = source:match("^(.*[/\\])") .. "?.lua;" .. package.path
 local realPrint, realOpen = print, io.open
-local queue, loops, hooks, keys, logs, boxes = {}, {}, {}, {}, {}, {}
+local hooks, keys, logs, boxes = {}, {}, {}, {}
 local inGame, onPanel, focusAfter, writes = false, nil, 1, 0
 local namesText = "0\t0\tExisting name\n"
 local function checkGame() assert(inGame, "editor UObject access outside game thread") end
@@ -24,15 +25,18 @@ end
 FText = function(s) return {ToString=function() return s end} end
 FName = function(s) return s end
 Key = {F2=113, RETURN=13, ESCAPE=27, LEFT_MOUSE_BUTTON=1, RIGHT_MOUSE_BUTTON=2}
-RegisterKeyBind = function(k, fn) keys[k]=fn end
+RegisterKeyBind = function(k, fn) keys[k]=function() assert(not inGame); fn() end end
 RegisterHook = function(path, fn) hooks[path]=fn end
+local HUD_TICK = "/Game/UI/HUD/TPSHud.TPSHud_C:ReceiveTick"
 NotifyOnNewObject = function(_, fn) onPanel=fn end
+local beforeHooks = {}
 package.loaded.loadout_runtime = {new=function() return {
   watchPanels=function(fn) onPanel=fn end, start=function() end,
+  beforeReadiness=function(name, fn) beforeHooks[name]=fn; return {remove=function() end} end,
   log=function(s) logs[#logs+1]=s end,
 } end}
-ExecuteInGameThread = function(fn) queue[#queue+1]=fn end
-LoopAsync = function(_, fn) loops[#loops+1]=fn end
+ExecuteInGameThread = function() error("ExecuteInGameThread is forbidden") end
+LoopAsync = function() error("LoopAsync is forbidden") end
 local function obj(name)
   return {IsValid=function(self) return not self.dead end, GetFullName=function() return name end}
 end
@@ -94,28 +98,28 @@ for i=0,19 do
   label.Font={FontObject=font}
   tiles[#tiles+1]=tile
 end
-panel.LoadoutList={GetChildrenCount=function() return #tiles end, GetChildAt=function(_,i) return tiles[i+1] end}
-local function flush()
-  local pending=queue; queue={}; inGame=true
-  for _,fn in ipairs(pending) do fn() end
+panel.LoadoutList={GetChildrenCount=function() return #tiles end, GetChildAt=function(_,i) return tiles[i+1] end,
+  GetFullName=function() return "panel.LoadoutList" end}
+local function hudTick(ms)
+  inGame=true
+  hooks[HUD_TICK](nil, {get=function() return ms/1000 end})
   inGame=false
 end
+-- flush: tasks queued since the last tick. tick: 50 ms frames for focus checks.
+local function flush() hudTick(0) end
 local function tick(n)
-  for _=1,n or 1 do
-    local pending=loops; loops={}
-    for _,fn in ipairs(pending) do if not fn() then loops[#loops+1]=fn end end
-    flush()
-  end
+  for _=1,n or 1 do hudTick(50) end
 end
 local function tabs(visibility)
   for _,prop in ipairs({"TraitTab","InventoryTab","MapTab"}) do assert(menu[prop].visibility == visibility) end
 end
 dofile(source)
-onPanel(panel); tick()
+inGame=true; beforeHooks.Construct(); onPanel(panel); inGame=false; tick()
+assert(hooks[HUD_TICK], "HUD tick not installed")
 local hover
 for path,fn in pairs(hooks) do if path:find("BoundEvent_4_",1,true) then hover=fn end end
 assert(hover,"hover hook not installed")
-hover({get=function() return tiles[1] end})
+inGame=true; hover({get=function() return tiles[1] end}); inGame=false
 local function open()
   keys[Key.F2](); flush()
   local box=boxes[#boxes]; assert(box.parent and tiles[1].Label.width == 0)
@@ -153,7 +157,7 @@ focusAfter=1; box=open(); box.Text={ToString=function() error("unreadable") end}
 keys[Key.RETURN](); flush(); tick(3)
 assert(writes == 3 and not box.parent, "unreadable text must not become a deleted name")
 box=open(); box.Text=FText("wrong character"); active.ID=1
-onPanel(panel); tick(); box.focused=false; tick(4)
+inGame=true; beforeHooks.Construct(); onPanel(panel); inGame=false; tick(); box.focused=false; tick(4)
 assert(writes == 3 and not box.parent, "do not save an old session into a different character")
 tabs(0)
 box=open(); tiles[1].dead=true; tick(4)

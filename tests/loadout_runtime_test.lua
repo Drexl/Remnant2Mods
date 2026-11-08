@@ -1,5 +1,7 @@
 -- Run from repo root: lua tests/loadout_runtime_test.lua
--- Scheduling/ownership mocks, not a real UE4SS marshaling test.
+-- The shared panel runtime in the modelled UE4SS process; not a native ABI test.
+package.path = "tests/support/?.lua;" .. package.path
+local W = require("remnant_world")
 local function read(path)
   local file = assert(io.open(path, "r"))
   local source = file:read("*a"); file:close()
@@ -7,104 +9,83 @@ local function read(path)
 end
 assert(read("LoadoutNamer/Scripts/loadout_runtime.lua") == read("MoreLoadoutSlots/Scripts/loadout_runtime.lua"),
   "standalone runtime copies must match")
-local realPrint = print
-local logs, loops, queue, subscribed = {}, {}, {}, {}
-local inGameThread = false
-print = function(message) logs[#logs + 1] = message end
-ExecuteInGameThread = function(fn) queue[#queue + 1] = fn end
-LoopAsync = function(_, fn) loops[#loops + 1] = fn end
-StaticFindObject = function(path)
-  assert(path == "/Script/UMG.UserWidget", "do not resolve an unloaded Blueprint class")
-  return {IsValid = function() return true end}
-end
-NotifyOnNewObject = function(path, fn)
-  assert(path == "/Script/UMG.UserWidget")
-  subscribed[#subscribed + 1] = fn
-end
-FindAllOf = function() error("global discovery scans are forbidden") end
-local function tickWorker()
-  local old = loops; loops = {}
-  for _, fn in ipairs(old) do
-    if not fn() then loops[#loops + 1] = fn end
-  end
-end
-local function tickGame()
-  local old = queue; queue = {}
-  inGameThread = true
-  for _, fn in ipairs(old) do fn() end
-  inGameThread = false
-end
-local function advance(count)
-  for _ = 1, count do tickWorker(); tickGame() end
-end
-local function panel(id, flags, className)
-  local p = {valid = true, count = 0, owner = true}
-  p.IsValid = function(self) return self.valid end
-  p.GetAddress = function() return id end
-  p.GetFullName = function() return "test.Panel" .. id end
-  p.GetClass = function()
-    return {GetFName = function() return {ToString = function() return className or "Widget_LoadoutsPanel_C" end} end}
-  end
-  p.HasAnyFlags = function(_, requested) return (requested & (flags or 0)) ~= 0 end
-  p.GetOwningPlayer = function(self)
-    assert(inGameThread)
-    return {IsValid = function() return self.owner end}
-  end
-  p.LoadoutList = {
-    IsValid = function() assert(inGameThread); return true end,
-    GetChildrenCount = function() assert(inGameThread); return p.count end,
-  }
-  return p
-end
-local runtime = dofile("LoadoutNamer/Scripts/loadout_runtime.lua").new("TestMod")
-local ready = {}
-runtime.watchPanels(function(p) assert(inGameThread); ready[#ready + 1] = p end)
+assert(read("LoadoutNamer/Scripts/game_tick.lua") == read("EquipmentSearch/Scripts/game_tick.lua"),
+  "standalone tick copies must match")
+
+local MAIN = [[
+local runtime = require("loadout_runtime").new("TestMod")
+READY, ORDER = {}, {}
+local hook = runtime.beforeReadiness("Refresh", function() ORDER[#ORDER + 1] = "before-refresh" end)
+runtime.beforeReadiness("Construct", function() ORDER[#ORDER + 1] = "before-construct" end)
+runtime.watchPanels(function(panel)
+  ORDER[#ORDER + 1] = "ready"
+  READY[#READY + 1] = panel
+  if REMOVE then hook.remove() end
+end)
 runtime.start()
-assert(#subscribed == 1)
-local notify = subscribed[1]
-notify(panel(0, nil, "OtherWidget_C"))
-notify(panel(1, 0x20))
-local cdo = panel(2)
-cdo.GetFullName = function() return "test.Default__Panel" end
-notify(cdo)
-assert(#loops == 0)
+]]
 
-local live = panel(3)
-notify(live); notify(live)
-assert(#loops == 1)
-for _ = 1, 100 do tickWorker() end
-assert(#queue == 1, "a stalled game thread must not accumulate readiness callbacks")
-tickGame()
-advance(2)
-assert(#ready == 0)
-live.count = 4
-advance(2)
-assert(#ready == 0, "wait for all eight vanilla tiles")
-live.count = 8
-advance(2)
-assert(#ready == 1 and ready[1] == live)
-notify(live); advance(2)
-assert(#ready == 1, "do not initialize a panel twice")
+local function start(classesLoaded)
+  local world = W.new()
+  if classesLoaded then world.engine.load(W.PANEL); world.engine.load(W.TILE) end
+  local env = world.engine.loadMod("TestMod", "LoadoutNamer/Scripts", nil, MAIN)
+  return world, world.engine, env
+end
 
-local destroyed = panel(4)
-notify(destroyed)
-destroyed.valid = false
-advance(2)
-assert(#ready == 1)
-local noOwner = panel(5)
-noOwner.count, noOwner.owner = 8, false
-notify(noOwner)
-advance(45)
-assert(#ready == 1 and #loops == 0, "bound readiness work for asset/ownerless panels")
-local reused = panel(4)
-reused.count = 8
-notify(reused); advance(2)
-assert(#ready == 2 and ready[2] == reused)
-local reopened = panel(6)
-reopened.count = 8
-notify(reopened); advance(2)
-assert(#ready == 3 and ready[3] == reopened)
-advance(100)
-assert(#loops == 0 and #queue == 0)
-print = realPrint
-print("PASS: cold-start native ancestor, template/owner/readiness/lifetime guards, deduplication, bounded work; no scans.")
+-- Cold start: listen on the native ancestor until the panel class exists.
+local world, engine, env = start(false)
+assert(#engine.listeners == 1 and next(engine.hooks) == nil)
+engine.load(W.PANEL); engine.load(W.TILE)
+world.userWidget("unrelated", "OtherWidget_C")
+world.userWidget("archetype", "Widget_LoadoutsPanel_C", {flags = 0x20})
+world.userWidget("cdo", "Widget_LoadoutsPanel_C", {flags = 0x10})
+world.userWidget("/Game/Pkg.Default__Widget_LoadoutsPanel_C", "Widget_LoadoutsPanel_C")
+local dead = world.userWidget("dead", "Widget_LoadoutsPanel_C", {dead = true})
+assert(dead and #engine.listeners == 1 and next(engine.hooks) == nil, "templates and unrelated widgets are ignored")
+
+-- The first live panel registers hooks before its own Construct, then stops listening.
+local live = world.openPanel()
+assert(#engine.listeners == 0)
+assert(#env.READY == 1 and env.READY[1] == live)
+assert(table.concat(env.ORDER, ",") == "before-refresh,before-construct,ready",
+  "the nested Refresh inside Construct must not ready the panel early")
+assert(engine.logCount("Live Loadouts panel ready") == 1)
+
+-- Rebuilds and later Refresh calls do not ready a panel twice.
+live.__raw.built = false
+world.build(live)
+world.refreshPanel(live)
+assert(#env.READY == 1)
+
+-- A panel with too few tiles at Construct is retried by its later Refresh.
+world.blockVanillaTiles = true
+local late = world.openPanel()
+assert(#env.READY == 1, "wait for all eight vanilla tiles")
+world.blockVanillaTiles = false
+world.refreshPanel(late)
+assert(#env.READY == 2 and env.READY[2] == late)
+
+-- Ownerless panels stop after a bounded number of hook events.
+local ownerless = world.openPanel({noOwner = true})
+for _ = 1, 45 do world.refreshPanel(ownerless) end
+assert(#env.READY == 2 and engine.logCount("Panel readiness timed out") == 1)
+
+-- A new panel at a collected panel's address is a new instance, even while a
+-- stale wrapper for that address still reports valid.
+local reused = world.openPanel({address = live.__raw.address})
+assert(#env.READY == 3 and env.READY[3] == reused)
+
+-- A pre-readiness hook can be retired from another UFunction's hook.
+env.REMOVE = true
+local refreshHooks = engine.hookCount(W.PANEL .. ":Refresh")
+world.openPanel()
+assert(engine.hookCount(W.PANEL .. ":Refresh") == refreshHooks - 1)
+engine.assertClean()
+
+-- Hot reload with the class resident registers immediately; no listener.
+world, engine, env = start(true)
+assert(#engine.listeners == 0 and engine.hookCount(W.PANEL .. ":Construct") == 2)
+world.openPanel()
+assert(#env.READY == 1)
+engine.assertClean()
+print("PASS: class-gated registration, cancelled listener, Construct-after-Refresh readiness, retries, bounded ownerless work, address reuse, hook retirement and hot reload.")

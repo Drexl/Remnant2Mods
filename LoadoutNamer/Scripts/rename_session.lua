@@ -1,19 +1,19 @@
--- One rename at a time, including queued opens/closes. UObject work stays on the
--- game thread; the worker only schedules a single outstanding observation.
+-- One rename at a time, including pending opens/closes. Keybinds only record
+-- requests; UObject work runs on HUD ticks (see game_tick.lua).
 local M = {}
 
-function M.new(close, log)
+function M.new(close, log, tick)
   local api, current = {}, nil
 
   local function finish(session, commit)
     if current ~= session then return end
     if session.closing then
-      -- Escape wins over a blur/Enter already waiting in the game-thread queue.
+      -- Escape wins over a blur/Enter whose close is still waiting for a tick.
       if not commit then session.commit = false end
       return
     end
     session.closing, session.commit = true, commit
-    ExecuteInGameThread(function()
+    tick.later(0, function()
       if current ~= session then return end
       current, session.closed = nil, true
       local ok, err = pcall(close, session, session.commit)
@@ -32,6 +32,30 @@ function M.new(close, log)
     session.focused = hasFocus(session.box)
   end
 
+  local function observe(session)
+    if not session.box:IsValid() or not session.tile:IsValid() then
+      finish(session, false)
+      return
+    end
+    if hasFocus(session.box) then
+      session.focused, session.blurTicks = true, 0
+    elseif not session.focused then
+      -- A newly attached Slate widget may not accept focus until the
+      -- next frame. Retry briefly, but never steal focus after blur.
+      if session.focusAttempts < 4 then
+        requestFocus(session)
+      else
+        log("Rename box did not accept keyboard focus; cancelling.")
+        finish(session, false)
+      end
+    else
+      session.blurTicks = session.blurTicks + 1
+      -- Give Enter/Escape keybinds time to choose commit/cancel before
+      -- interpreting Slate's own key-driven defocus as a click away.
+      if session.blurTicks >= 2 then finish(session, true) end
+    end
+  end
+
   function api.active()
     return current ~= nil
   end
@@ -43,7 +67,7 @@ function M.new(close, log)
   function api.pointerPressed()
     local session = current
     if not session or session.closing then return end
-    ExecuteInGameThread(function()
+    tick.later(0, function()
       if current ~= session or session.closing then return end
       local ok, err = pcall(function()
         if not session.box or not session.box:IsValid() then
@@ -61,59 +85,35 @@ function M.new(close, log)
     end)
   end
 
+  -- create(session) returns false when there is nothing to edit.
   function api.open(session, create)
     if current then return false end
-    current = session -- reserve before queuing, so repeated F2 cannot open twice
+    current = session -- reserve now, so repeated F2 cannot open twice
     session.focusAttempts, session.blurTicks = 0, 0
-    ExecuteInGameThread(function()
+    tick.later(0, function()
       if current ~= session or session.closing then return end
-      local ok, err = pcall(function()
+      local ok, opened = pcall(function()
+        if create(session) == false then return false end
         assert(session.tile and session.tile:IsValid(), "loadout tile is unavailable")
-        create(session)
         assert(session.box and session.box:IsValid(), "rename box is unavailable")
         requestFocus(session)
+        return true
       end)
       if not ok then
-        log("Could not focus/open the rename box: " .. tostring(err))
+        log("Could not focus/open the rename box: " .. tostring(opened))
         finish(session, false)
         return
       end
-
-      LoopAsync(50, function()
+      if not opened then
+        finish(session, false)
+        return
+      end
+      tick.loop(50, function()
         if current ~= session or session.closing then return true end
-        if not session.queued then
-          session.queued = true
-          ExecuteInGameThread(function()
-            session.queued = false
-            if current ~= session or session.closing then return end
-            local observed, observeErr = pcall(function()
-              if not session.box:IsValid() or not session.tile:IsValid() then
-                finish(session, false)
-                return
-              end
-              if hasFocus(session.box) then
-                session.focused, session.blurTicks = true, 0
-              elseif not session.focused then
-                -- A newly attached Slate widget may not accept focus until the
-                -- next frame. Retry briefly, but never steal focus after blur.
-                if session.focusAttempts < 4 then
-                  requestFocus(session)
-                else
-                  log("Rename box did not accept keyboard focus; cancelling.")
-                  finish(session, false)
-                end
-              else
-                session.blurTicks = session.blurTicks + 1
-                -- Give Enter/Escape keybinds time to choose commit/cancel before
-                -- interpreting Slate's own key-driven defocus as a click away.
-                if session.blurTicks >= 2 then finish(session, true) end
-              end
-            end)
-            if not observed then
-              log("Rename focus check failed: " .. tostring(observeErr))
-              finish(session, false)
-            end
-          end)
+        local observed, observeErr = pcall(observe, session)
+        if not observed then
+          log("Rename focus check failed: " .. tostring(observeErr))
+          finish(session, false)
         end
         return current ~= session or session.closing
       end)
