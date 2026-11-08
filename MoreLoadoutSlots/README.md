@@ -5,7 +5,7 @@ Raises the Character screen's loadout count from **8 to 20**.
 ## What it does
 
 - Adds 12 extra loadout tiles to the Loadouts panel, reachable by mouse-wheel
-  scrolling in a slim in-panel scrollbar.
+  scrolling with the vanilla advanced-stats scrollbar's styling and behavior.
 - Every extra slot behaves exactly like a vanilla slot: right-click to save,
   left-click or Space to equip, F to delete — same confirmation dialogs, same
   rules (can't overwrite the currently-equipped loadout, can't load/delete an
