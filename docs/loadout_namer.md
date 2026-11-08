@@ -4,7 +4,7 @@ Status: **feature-complete and user-confirmed** as of 2026-07-13. Source: `Loado
 
 ## What it does
 
-- **Rename**: hover a loadout tile on the character screen, press **F2** → an `EditableTextBox` styled to the game's look (GFGRemnantCracked font 10, ashen 0.85 text, dark translucent fill) replaces the title text in the tile's title row. **Enter/F2** commits, **Escape** cancels, committing empty removes the custom name.
+- **Rename**: hover a loadout tile on the character screen, press **F2** → an `EditableTextBox` styled to the game's look (GFGRemnantCracked font 10, ashen 0.85 text, dark translucent fill) replaces the title text in the tile's title row. The editor immediately requests keyboard focus with any existing custom name selected. **Enter/F2** or clicking outside commits, **Escape** cancels, committing empty removes the custom name.
 - **Display**: names render via `tile.LabelOverride` + `Refresh()`, re-applied instantly whenever the panel is constructed, to whatever tile count exists at that moment — then reapplied if the count changes (MoreLoadoutSlots' synchronous tile injection landing after; fixed 2026-07-17, see Warts). Tile shows at most 18 chars (`..`-truncated); the hover tooltip's title (`ItemLabel`) shows the full name (cap 32).
 - **Tooltip integration**: title swap per hover, plus an "F2 Rename" prompt injected into the tooltip's `ExtraActionList` action row (hidden on the Last Gear State tile).
 - **Persistence**: `ue4ss/Mods/LoadoutNamer/loadout_names.txt`, tab-separated `recordIndex<TAB>name` lines, whole-file rewrite on every commit. Tabs/newlines stripped from names on commit.
@@ -19,13 +19,14 @@ Status: **feature-complete and user-confirmed** as of 2026-07-13. Source: `Loado
 | **F2** (while hovering a tile) | Start renaming that loadout |
 | **Enter** or **F2** (while editing) | Commit the new name |
 | **Escape** (while editing) | Cancel, keep the old name |
+| **Click outside** (while editing) | Save and dismiss the editor; the click still acts normally |
 
 **How to rename a loadout:**
 
 1. Open the character screen and go to the Loadouts panel.
 2. Hover the mouse over the loadout tile you want to rename.
 3. Press **F2**. The tile's title text is replaced by a text box (dark fill, game font). It already has keyboard focus — just type.
-4. Press **Enter** (or F2 again) to save, or **Escape** to cancel.
+4. Press **Enter** (or F2 again), or click outside the box, to save. Press **Escape** to cancel.
 5. To remove a custom name, rename the slot and commit with the box empty — the tile returns to its default label ("Loadout N" / the archetype-combo name).
 
 **What to expect on screen:**
@@ -42,6 +43,7 @@ Status: **feature-complete and user-confirmed** as of 2026-07-13. Source: `Loado
 - Default labels: records ≤ 10 regenerate natively from an empty override; records > 10 must get back MoreLoadoutSlots' pinned `"Loadout N"` (N = record index) when a custom name is removed.
 - Hover identity comes from the `Widget_Loadout_C` OnMouseEnter bound-event hook (`..._4_OnAdvButtonClickedEvent...`); the hook body only does `self:get()` + an `Index` property read.
 - The rename box lives in the title row (`tile.Label:GetParent()`); the label is blanked and its width reservation released via `SetMinDesiredWidth(0)` for the edit, restored to 130 after (real setter mandatory — H4).
+- `rename_session.lua` reserves queued opens/closes, focuses after insertion, and watches only the active editor at 50ms intervals on the game thread. Both direct keyboard focus and focused Slate descendants count. Click-away also checks `IsHovered()` so non-focusable targets dismiss the box. It never consumes the normal mouse action or binds unsupported multicast delegates. Escape overrides a commit still queued for cleanup; failed text reads cancel rather than deleting an existing name.
 - Tooltip work runs on a ~1s 50ms poll per hover (`FindAllOf("Widget_LoadoutTooltip_C")`, skip `Default__`), superseded by a generation counter on the next hover. Prompt widgets are tracked per tooltip instance (`ExtraActionList` full name).
 - Names file path is probed from two candidates at load because the game's io CWD is the exe dir; the `ue4ss/Mods/...` prefix is the one that resolves on the current install.
 
