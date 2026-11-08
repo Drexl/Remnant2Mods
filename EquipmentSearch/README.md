@@ -40,7 +40,9 @@ A working search bar for your inventory.
 - The search filter resets when you switch tabs on the Inventory screen.
 - An upgraded item keeps its old "+N" text in the search cache until you
   relaunch (its name still matches fine in the meantime).
-- Works identically on both UE4SS builds — no stable-only caveats for this mod.
+- Earlier builds can require one hot-reload after launch on stable UE4SS.
+  This source fixes that startup issue with a native-widget listener, verified
+  on a cold first equipment-screen open with stable v3.0.1.
 
 ## License
 

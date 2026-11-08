@@ -30,7 +30,7 @@ interchangeable — pick based on whether you also use asset/pak mods:
 | **Mod folder location** | `<Remnant2>\Binaries\Win64\ue4ss\Mods\` | `<Remnant2>\Binaries\Win64\Mods\` (no `ue4ss` subfolder) |
 | MoreLoadoutSlots | Full native behavior. | 20 slots on the first screen open, using the Lua interaction fallback. |
 | LoadoutNamer | Full native behavior, fully styled. | Styled rename editor and tooltip prompt. |
-| EquipmentSearch | Full native behavior. | Fully functional, filtering works identically. |
+| EquipmentSearch | Full native behavior. | Filtering works identically. Native-widget startup listener verified on a cold first equipment-screen open. Earlier builds can require one hot-reload after launch. |
 
 Everything above is handled automatically — there's no setting to flip. Just
 install the matching UE4SS build for your situation and the mods detect and
